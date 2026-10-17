@@ -27,7 +27,9 @@ Create `.streamlit/secrets.toml` locally (it is ignored by Git) and add:
 GEMINI_API_KEY = "your-google-ai-api-key"
 ```
 
-Alternatively set `GEMINI_API_KEY` in the environment. When you submit a brief in **Content studio**, the app automatically calls Imagen (`imagen-4.0-generate-001`), chooses `9:16` for Instagram story or `1:1` for other destinations, and shows the returned image for approval. No manual Gemini or Canva step is required.
+Alternatively set `GEMINI_API_KEY` in the environment. When you submit a brief in **Content studio**, the app automatically calls Gemini's image model (`gemini-2.5-flash-image`), chooses `9:16` for Instagram story or `1:1` for other destinations, and shows the returned image for approval. No manual Gemini or Canva step is required.
+
+If Google returns `429 RESOURCE_EXHAUSTED` with a quota limit of `0`, the key is valid but the Google project does not have image-generation quota. Link a billing account or use a Google AI project with image-model quota, then restart the Streamlit app.
 
 ## Run
 

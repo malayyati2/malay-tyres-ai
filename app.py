@@ -16,7 +16,7 @@ from tyre_agents.core import (
     generate_reply,
     publish_approved,
 )
-from tyre_agents.gemini import GeminiImageGenerator
+from tyre_agents.gemini import GeminiImageGenerator, explain_image_error
 
 
 st.set_page_config(page_title="Malay Tyres command centre", page_icon=":material/tire_repair:", layout="wide")
@@ -236,7 +236,7 @@ def render_draft_preview(draft: ContentDraft) -> None:
         st.code(draft.image_prompt, language="text")
         st.markdown("**Publish to**")
         st.write(" · ".join(DESTINATION_LABELS[destination] for destination in draft.destinations) or "No channel selected")
-        st.caption("The prompt is retained as an audit trail. The image is generated automatically with Gemini/Imagen when you submit the brief.")
+        st.caption("The prompt is retained as an audit trail. The image is generated automatically with Gemini when you submit the brief.")
 
 
 def render_generated_image(draft: ContentDraft) -> None:
@@ -298,19 +298,19 @@ def render_content_studio() -> None:
             add_activity("Content agent", f"Generated copy and an image prompt for {topic}")
             aspect_ratio = "9:16" if Destination.INSTAGRAM_STORY in draft.destinations else "1:1"
             try:
-                with st.spinner("Generating the image automatically with Gemini/Imagen..."):
+                with st.spinner("Generating the image automatically with Gemini..."):
                     st.session_state.generated_image = GeminiImageGenerator(gemini_api_key()).generate(
                         draft.image_prompt,
                         aspect_ratio,
                     )
-                add_activity("Image agent", f"Generated a {aspect_ratio} creative with Gemini/Imagen")
+                add_activity("Image agent", f"Generated a {aspect_ratio} creative with Gemini")
                 st.success("Draft and image created automatically. Review both below.", icon=":material/check_circle:")
             except ValueError as exc:
                 st.session_state.image_error = str(exc)
                 st.warning("The copy was created, but the image could not be generated yet.", icon=":material/warning:")
-            except Exception:
-                st.session_state.image_error = "Gemini image generation failed. Check the API key, model access, quota and network connection."
-                st.warning("The copy was created, but Gemini/Imagen did not return an image.", icon=":material/warning:")
+            except Exception as exc:
+                st.session_state.image_error = explain_image_error(exc)
+                st.warning("The copy was created, but Gemini did not return an image.", icon=":material/warning:")
 
     draft = st.session_state.draft
     if draft is None:
@@ -357,8 +357,8 @@ def render_content_studio() -> None:
 
 def render_connections() -> None:
     st.header("Connections and guardrails")
-    st.write("Gemini/Imagen image generation is live when a key is configured. The remaining publishing connectors are still safe demo adapters.")
-    st.warning("This build does not make live calls to Google Business Profile, Canva, Instagram or WhatsApp. Gemini/Imagen is the exception: submitting a content brief calls the configured Gemini API to generate the image.", icon=":material/shield:")
+    st.write("Gemini image generation is live when a key is configured. The remaining publishing connectors are still safe demo adapters.")
+    st.warning("This build does not make live calls to Google Business Profile, Canva, Instagram or WhatsApp. Gemini is the exception: submitting a content brief calls the configured Gemini image model.", icon=":material/shield:")
     descriptions = {
         "Google Business Profile": "Read new reviews and publish approved replies through Google OAuth.",
         "Gemini / Antigravity": "Generate campaign variations and image prompts using your chosen AI provider.",

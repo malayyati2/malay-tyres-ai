@@ -1,15 +1,17 @@
-"""Small, testable adapter for Gemini/Imagen image generation."""
+"""Small, testable adapter for Gemini image generation."""
 
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 
-DEFAULT_IMAGEN_MODEL = "imagen-4.0-generate-001"
+DEFAULT_GEMINI_IMAGE_MODEL = "gemini-2.5-flash-image"
+# Kept as an alias for callers that used the first Imagen-based prototype.
+DEFAULT_IMAGEN_MODEL = DEFAULT_GEMINI_IMAGE_MODEL
 
 
 class ImageModels(Protocol):
-    def generate_images(self, *, model: str, prompt: str, config: Any) -> Any:
-        """Generate images using an Imagen-capable client."""
+    def generate_content(self, *, model: str, contents: str, config: Any) -> Any:
+        """Generate image content using a Gemini image-capable client."""
 
 
 class GeminiClient(Protocol):
@@ -21,6 +23,25 @@ class GeneratedImage:
     image_bytes: bytes
     mime_type: str
     model: str
+
+
+def explain_image_error(error: Exception) -> str:
+    """Turn common provider failures into safe, actionable UI text."""
+    message = str(error)
+    upper_message = message.upper()
+    if "429" in message or "RESOURCE_EXHAUSTED" in upper_message or "QUOTA" in upper_message:
+        return (
+            "Gemini accepted the API key, but this Google project has no available image-generation quota. "
+            "Enable billing or use a project with image-model quota, then try again."
+        )
+    if "404" in message or "NOT_FOUND" in upper_message or "MODEL IS NOT FOUND" in upper_message:
+        return (
+            "The configured Gemini image model is not available for this API project. "
+            "Check the selected model and the Google AI API access for this key."
+        )
+    if "401" in message or "403" in message or "UNAUTHENTICATED" in upper_message or "PERMISSION_DENIED" in upper_message:
+        return "Gemini rejected the API key. Check that the key is active and has access to the Gemini API."
+    return "Gemini image generation failed. Check the API key, model access, quota and network connection."
 
 
 class GeminiImageGenerator:
@@ -35,7 +56,7 @@ class GeminiImageGenerator:
         self,
         api_key: str | None,
         *,
-        model: str = DEFAULT_IMAGEN_MODEL,
+        model: str = DEFAULT_GEMINI_IMAGE_MODEL,
         client: GeminiClient | None = None,
     ) -> None:
         if not api_key or not api_key.strip():
@@ -57,27 +78,36 @@ class GeminiImageGenerator:
         try:
             from google.genai import types
 
-            response = client.models.generate_images(
+            response = client.models.generate_content(
                 model=self.model,
-                prompt=prompt,
-                config=types.GenerateImagesConfig(
-                    number_of_images=1,
-                    aspect_ratio=aspect_ratio,
-                    output_mime_type="image/png",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE"],
+                    image_config=types.ImageConfig(aspect_ratio=aspect_ratio),
                 ),
             )
-            generated = getattr(response, "generated_images", None)
-            image = generated[0].image if generated else None
-            image_bytes = getattr(image, "image_bytes", None)
-            mime_type = getattr(image, "mime_type", None)
+            candidates = getattr(response, "candidates", None) or []
+            parts = getattr(candidates[0].content, "parts", None) if candidates else None
+            inline_data = next(
+                (getattr(part, "inline_data", None) for part in (parts or []) if getattr(part, "inline_data", None)),
+                None,
+            )
+            image_bytes = getattr(inline_data, "data", None)
+            mime_type = getattr(inline_data, "mime_type", None)
         except (AttributeError, IndexError, KeyError, TypeError) as exc:
-            raise ValueError("Imagen returned a malformed image response.") from exc
+            raise ValueError("Gemini returned a malformed image response.") from exc
 
         if not isinstance(image_bytes, bytes) or not image_bytes:
-            raise ValueError("Imagen returned a malformed image response: image bytes missing.")
+            raise ValueError("Gemini returned a malformed image response: image bytes missing.")
         if not isinstance(mime_type, str) or not mime_type:
-            raise ValueError("Imagen returned a malformed image response: MIME type missing.")
+            raise ValueError("Gemini returned a malformed image response: MIME type missing.")
         return GeneratedImage(image_bytes=image_bytes, mime_type=mime_type, model=self.model)
 
 
-__all__ = ["DEFAULT_IMAGEN_MODEL", "GeneratedImage", "GeminiImageGenerator"]
+__all__ = [
+    "DEFAULT_GEMINI_IMAGE_MODEL",
+    "DEFAULT_IMAGEN_MODEL",
+    "GeneratedImage",
+    "GeminiImageGenerator",
+    "explain_image_error",
+]
