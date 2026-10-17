@@ -1,0 +1,16 @@
+[theme]
+base = "light"
+primaryColor = "#c46b18"
+backgroundColor = "#f7f8f6"
+secondaryBackgroundColor = "#edf1ef"
+textColor = "#17211b"
+font = "sans-serif"
+baseRadius = "medium"
+buttonRadius = "medium"
+showWidgetBorder = true
+showSidebarBorder = true
+paddingTop = "1.5rem"
+paddingBottom = "2rem"
+
+[server]
+headless = true
