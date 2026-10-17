@@ -10,6 +10,7 @@ from .core import (
     generate_reply,
     publish_approved,
 )
+from .gemini import GeneratedImage, GeminiImageGenerator
 
 __all__ = [
     "ApprovalQueue",
@@ -20,4 +21,6 @@ __all__ = [
     "generate_content",
     "generate_reply",
     "publish_approved",
+    "GeneratedImage",
+    "GeminiImageGenerator",
 ]

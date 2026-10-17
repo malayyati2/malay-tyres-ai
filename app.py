@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import os
 from zoneinfo import ZoneInfo
 
 import streamlit as st
@@ -15,6 +16,7 @@ from tyre_agents.core import (
     generate_reply,
     publish_approved,
 )
+from tyre_agents.gemini import GeminiImageGenerator
 
 
 st.set_page_config(page_title="Malay Tyres command centre", page_icon=":material/tire_repair:", layout="wide")
@@ -34,6 +36,24 @@ def now_label() -> str:
     return datetime.now(APP_TIMEZONE).strftime("%d %b %Y, %I:%M %p")
 
 
+def gemini_api_key() -> str | None:
+    """Read the image-provider key without ever placing it in workspace files."""
+    environment_key = os.getenv("GEMINI_API_KEY")
+    if environment_key:
+        return environment_key
+    try:
+        direct_key = st.secrets.get("GEMINI_API_KEY")
+        if direct_key:
+            return str(direct_key)
+        gemini_section = st.secrets.get("gemini")
+        if gemini_section and gemini_section.get("api_key"):
+            return str(gemini_section["api_key"])
+    except Exception:
+        # Streamlit raises when no secrets file exists. The UI explains the setup gap.
+        return None
+    return None
+
+
 def initialize_state() -> None:
     if "reviews" not in st.session_state:
         st.session_state.reviews = {
@@ -46,6 +66,8 @@ def initialize_state() -> None:
         }
     st.session_state.setdefault("queue", ApprovalQueue())
     st.session_state.setdefault("draft", None)
+    st.session_state.setdefault("generated_image", None)
+    st.session_state.setdefault("image_error", None)
     st.session_state.setdefault("publisher", InMemoryPublisher())
     st.session_state.setdefault("publishing_log", [])
     st.session_state.setdefault("activity_log", [
@@ -214,7 +236,33 @@ def render_draft_preview(draft: ContentDraft) -> None:
         st.code(draft.image_prompt, language="text")
         st.markdown("**Publish to**")
         st.write(" · ".join(DESTINATION_LABELS[destination] for destination in draft.destinations) or "No channel selected")
-        st.caption("The prompt is ready to paste into Gemini or Canva. A production connector can replace this stub with generated media.")
+        st.caption("The prompt is retained as an audit trail. The image is generated automatically with Gemini/Imagen when you submit the brief.")
+
+
+def render_generated_image(draft: ContentDraft) -> None:
+    with st.container(border=True):
+        st.subheader("AI-generated image")
+        generated_image = st.session_state.generated_image
+        if generated_image is not None:
+            st.image(
+                generated_image.image_bytes,
+                caption=f"Generated automatically with {generated_image.model}",
+                alt="AI-generated Malay Tyres social media creative",
+                width="stretch",
+            )
+            st.download_button(
+                "Download generated image",
+                data=generated_image.image_bytes,
+                file_name=f"{draft.draft_id}.png",
+                mime=generated_image.mime_type,
+                icon=":material/download:",
+                width="stretch",
+            )
+        elif st.session_state.image_error:
+            st.warning(st.session_state.image_error, icon=":material/warning:")
+            st.caption("Add GEMINI_API_KEY to Streamlit secrets or the environment, then submit the brief again.")
+        else:
+            st.info("The image agent will generate the creative when you submit a brief.", icon=":material/image:")
 
 
 def render_content_studio() -> None:
@@ -245,8 +293,24 @@ def render_content_studio() -> None:
             )
             st.session_state.queue.add(draft)
             st.session_state.draft = draft
+            st.session_state.generated_image = None
+            st.session_state.image_error = None
             add_activity("Content agent", f"Generated copy and an image prompt for {topic}")
-            st.success("Draft created. Review the copy and image prompt below.", icon=":material/check_circle:")
+            aspect_ratio = "9:16" if Destination.INSTAGRAM_STORY in draft.destinations else "1:1"
+            try:
+                with st.spinner("Generating the image automatically with Gemini/Imagen..."):
+                    st.session_state.generated_image = GeminiImageGenerator(gemini_api_key()).generate(
+                        draft.image_prompt,
+                        aspect_ratio,
+                    )
+                add_activity("Image agent", f"Generated a {aspect_ratio} creative with Gemini/Imagen")
+                st.success("Draft and image created automatically. Review both below.", icon=":material/check_circle:")
+            except ValueError as exc:
+                st.session_state.image_error = str(exc)
+                st.warning("The copy was created, but the image could not be generated yet.", icon=":material/warning:")
+            except Exception:
+                st.session_state.image_error = "Gemini image generation failed. Check the API key, model access, quota and network connection."
+                st.warning("The copy was created, but Gemini/Imagen did not return an image.", icon=":material/warning:")
 
     draft = st.session_state.draft
     if draft is None:
@@ -255,6 +319,7 @@ def render_content_studio() -> None:
 
     st.space("small")
     render_draft_preview(draft)
+    render_generated_image(draft)
     with st.container(border=True):
         st.subheader("2. Review and approve")
         edited_title = st.text_input("Title", value=draft.title, key="draft_title")
@@ -292,8 +357,8 @@ def render_content_studio() -> None:
 
 def render_connections() -> None:
     st.header("Connections and guardrails")
-    st.write("Connect real providers here later. The demo keeps secrets out of the codebase and uses safe adapters until you configure APIs.")
-    st.warning("This build does not make live calls to Google, Gemini, Canva, Instagram or WhatsApp. That protects your business while the approval flow is being tested.", icon=":material/shield:")
+    st.write("Gemini/Imagen image generation is live when a key is configured. The remaining publishing connectors are still safe demo adapters.")
+    st.warning("This build does not make live calls to Google Business Profile, Canva, Instagram or WhatsApp. Gemini/Imagen is the exception: submitting a content brief calls the configured Gemini API to generate the image.", icon=":material/shield:")
     descriptions = {
         "Google Business Profile": "Read new reviews and publish approved replies through Google OAuth.",
         "Gemini / Antigravity": "Generate campaign variations and image prompts using your chosen AI provider.",
@@ -302,17 +367,21 @@ def render_connections() -> None:
     }
     for name, description in descriptions.items():
         with st.container(border=True):
-            status = st.session_state.connections[name]
+            key_ready = name == "Gemini / Antigravity" and bool(gemini_api_key())
+            status = key_ready or st.session_state.connections[name]
             left, right = st.columns([3, 1], vertical_alignment="center")
             with left:
                 st.markdown(f"**{name}**")
                 st.caption(description)
             with right:
-                badge("Connected" if status else "Not connected", "green" if status else "gray")
-                if st.button("Disconnect" if status else "Connect demo", key=f"connection_{name}"):
-                    st.session_state.connections[name] = not status
-                    add_activity("System", f"{'Connected' if not status else 'Disconnected'} {name}")
-                    st.rerun()
+                if name == "Gemini / Antigravity":
+                    badge("API key ready" if key_ready else "Needs API key", "green" if key_ready else "orange")
+                else:
+                    badge("Connected" if status else "Not connected", "green" if status else "gray")
+                    if st.button("Disconnect" if status else "Connect demo", key=f"connection_{name}"):
+                        st.session_state.connections[name] = not status
+                        add_activity("System", f"{'Connected' if not status else 'Disconnected'} {name}")
+                        st.rerun()
     st.space("small")
     with st.container(border=True):
         st.subheader("Production checklist")
