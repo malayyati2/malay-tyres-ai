@@ -24,6 +24,9 @@ This creates a project-local environment from the pinned `uv.lock`. Keep real cr
 Create `.streamlit/secrets.toml` locally (it is ignored by Git) and add the following keys:
 
 ```toml
+CANVA_CLIENT_ID = "your-canva-client-id"
+CANVA_CLIENT_SECRET = "your-canva-client-secret"
+CANVA_REDIRECT_URI = "https://your-app-name.streamlit.app"
 CANVA_ACCESS_TOKEN = "your-canva-oauth-access-token"
 CANVA_BRAND_TEMPLATE_ID = "your-canva-brand-template-id"
 CANVA_TITLE_FIELD = "TITLE"
@@ -41,6 +44,8 @@ META_GRAPH_API_VERSION = "v21.0"
 ```
 
 The Canva template must be a published Brand Template with autofill fields matching the configured field names. Canva's public REST APIs support brand-template autofill and PNG export, but do not expose Canva Magic Media text-to-image generation as a REST endpoint. This app therefore creates the design automatically from your branded Canva template; no manual Canva editing step is required during each campaign.
+
+The Connections page now includes a **Authorize Canva** button when `CANVA_CLIENT_ID`, `CANVA_CLIENT_SECRET` and `CANVA_REDIRECT_URI` are configured. Add the exact same redirect URI in the Canva Developer Portal. After authorization, the app exchanges the OAuth code server-side using PKCE. For a persistent deployed connection, store the resulting access/refresh tokens in a proper encrypted database; Streamlit session state is suitable for this trial only.
 
 The Instagram image and WhatsApp image message use Canva's exported image URL. Canva export URLs expire after 24 hours, so approve and publish the campaign during that window.
 

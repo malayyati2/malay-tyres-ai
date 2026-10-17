@@ -16,6 +16,7 @@ from tyre_agents.core import (
     generate_reply,
     publish_approved,
 )
+from tyre_agents.canva_oauth import create_pkce_request, exchange_code
 from tyre_agents.providers import CanvaAdapter, InstagramAdapter, ProviderError, WhatsAppAdapter
 
 
@@ -47,8 +48,55 @@ def secret(name: str, default: str = "") -> str:
         return default
 
 
+def canva_access_token() -> str:
+    return str(st.session_state.get("canva_access_token") or secret("CANVA_ACCESS_TOKEN"))
+
+
+def canva_redirect_uri() -> str:
+    configured = secret("CANVA_REDIRECT_URI")
+    if configured:
+        return configured
+    return "http://localhost:8501"
+
+
+def handle_canva_oauth_callback() -> None:
+    code = st.query_params.get("code")
+    returned_state = st.query_params.get("state")
+    if not code or not returned_state or st.session_state.get("canva_last_code") == code:
+        return
+    st.session_state.canva_last_code = code
+    expected_state = st.session_state.get("canva_oauth_state")
+    verifier = st.session_state.get("canva_code_verifier")
+    if not expected_state or returned_state != expected_state or not verifier:
+        st.session_state.canva_oauth_error = "Canva OAuth state validation failed. Start the connection again."
+        return
+    try:
+        token_response = exchange_code(
+            code,
+            verifier,
+            secret("CANVA_CLIENT_ID"),
+            secret("CANVA_CLIENT_SECRET"),
+            canva_redirect_uri(),
+        )
+        st.session_state.canva_access_token = str(token_response["access_token"])
+        st.session_state.canva_refresh_token = str(token_response.get("refresh_token", ""))
+        st.session_state.canva_oauth_error = ""
+    except Exception:
+        st.session_state.canva_oauth_error = "Canva OAuth token exchange failed. Check the Client ID, Client secret and redirect URL."
+
+
+def canva_authorization_url() -> str | None:
+    client_id = secret("CANVA_CLIENT_ID")
+    if not client_id or not secret("CANVA_CLIENT_SECRET"):
+        return None
+    request = create_pkce_request(client_id, canva_redirect_uri())
+    st.session_state.canva_oauth_state = request.state
+    st.session_state.canva_code_verifier = request.code_verifier
+    return request.authorization_url
+
+
 def canva_ready() -> bool:
-    return bool(secret("CANVA_ACCESS_TOKEN") and secret("CANVA_BRAND_TEMPLATE_ID"))
+    return bool(canva_access_token() and secret("CANVA_BRAND_TEMPLATE_ID"))
 
 
 def instagram_ready() -> bool:
@@ -68,7 +116,7 @@ def generate_canva_design(draft: ContentDraft) -> dict:
     field_body = secret("CANVA_BODY_FIELD", "BODY")
     field_cta = secret("CANVA_CTA_FIELD", "CTA")
     adapter = CanvaAdapter(
-        access_token=secret("CANVA_ACCESS_TOKEN"),
+        access_token=canva_access_token(),
         brand_template_id=secret("CANVA_BRAND_TEMPLATE_ID"),
     )
     return adapter.autofill_export(
@@ -137,6 +185,10 @@ def initialize_state() -> None:
     st.session_state.setdefault("draft", None)
     st.session_state.setdefault("generated_design", None)
     st.session_state.setdefault("design_error", None)
+    st.session_state.setdefault("canva_access_token", "")
+    st.session_state.setdefault("canva_refresh_token", "")
+    st.session_state.setdefault("canva_oauth_error", "")
+    st.session_state.setdefault("canva_last_code", "")
     st.session_state.setdefault("publisher", InMemoryPublisher())
     st.session_state.setdefault("publishing_log", [])
     st.session_state.setdefault("activity_log", [
@@ -444,6 +496,21 @@ def render_connections() -> None:
                 badge("Configured" if key_ready else "Needs secrets", "green" if key_ready else "orange")
     st.space("small")
     with st.container(border=True):
+        st.subheader("Connect Canva with OAuth")
+        st.caption("Use your Canva Client ID and Client secret here through Streamlit secrets. The secret stays on the server; only the Canva authorization page opens in your browser.")
+        if canva_access_token():
+            st.success("Canva access token is available for this session.", icon=":material/check_circle:")
+        elif secret("CANVA_CLIENT_ID") and secret("CANVA_CLIENT_SECRET"):
+            authorization_url = canva_authorization_url()
+            if authorization_url:
+                st.link_button("Authorize Canva", authorization_url, icon=":material/login:", width="stretch")
+                st.caption(f"Canva must redirect back to: {canva_redirect_uri()}")
+        else:
+            st.info("Add CANVA_CLIENT_ID, CANVA_CLIENT_SECRET and CANVA_REDIRECT_URI to Streamlit secrets, then this button will appear.", icon=":material/key:")
+        if st.session_state.canva_oauth_error:
+            st.error(st.session_state.canva_oauth_error, icon=":material/error:")
+    st.space("small")
+    with st.container(border=True):
         st.subheader("Production checklist")
         st.markdown(":material/check_box_outline_blank: Add Canva access token and brand template ID")
         st.markdown(":material/check_box_outline_blank: Add Instagram Graph API token and business account ID")
@@ -452,6 +519,7 @@ def render_connections() -> None:
 
 
 initialize_state()
+handle_canva_oauth_callback()
 view = render_sidebar()
 render_header()
 
