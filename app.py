@@ -16,7 +16,7 @@ from tyre_agents.core import (
     generate_reply,
     publish_approved,
 )
-from tyre_agents.gemini import GeminiImageGenerator, explain_image_error
+from tyre_agents.providers import CanvaAdapter, InstagramAdapter, ProviderError, WhatsAppAdapter
 
 
 st.set_page_config(page_title="Malay Tyres command centre", page_icon=":material/tire_repair:", layout="wide")
@@ -36,22 +36,91 @@ def now_label() -> str:
     return datetime.now(APP_TIMEZONE).strftime("%d %b %Y, %I:%M %p")
 
 
-def gemini_api_key() -> str | None:
-    """Read the image-provider key without ever placing it in workspace files."""
-    environment_key = os.getenv("GEMINI_API_KEY")
-    if environment_key:
-        return environment_key
+def secret(name: str, default: str = "") -> str:
+    environment_value = os.getenv(name)
+    if environment_value:
+        return environment_value
     try:
-        direct_key = st.secrets.get("GEMINI_API_KEY")
-        if direct_key:
-            return str(direct_key)
-        gemini_section = st.secrets.get("gemini")
-        if gemini_section and gemini_section.get("api_key"):
-            return str(gemini_section["api_key"])
+        value = st.secrets.get(name)
+        return str(value) if value else default
     except Exception:
-        # Streamlit raises when no secrets file exists. The UI explains the setup gap.
-        return None
-    return None
+        return default
+
+
+def canva_ready() -> bool:
+    return bool(secret("CANVA_ACCESS_TOKEN") and secret("CANVA_BRAND_TEMPLATE_ID"))
+
+
+def instagram_ready() -> bool:
+    return bool(secret("INSTAGRAM_ACCESS_TOKEN") and secret("INSTAGRAM_BUSINESS_ACCOUNT_ID"))
+
+
+def whatsapp_ready() -> bool:
+    return bool(
+        secret("WHATSAPP_ACCESS_TOKEN")
+        and secret("WHATSAPP_PHONE_NUMBER_ID")
+        and secret("WHATSAPP_RECIPIENT_PHONE")
+    )
+
+
+def generate_canva_design(draft: ContentDraft) -> dict:
+    field_title = secret("CANVA_TITLE_FIELD", "TITLE")
+    field_body = secret("CANVA_BODY_FIELD", "BODY")
+    field_cta = secret("CANVA_CTA_FIELD", "CTA")
+    adapter = CanvaAdapter(
+        access_token=secret("CANVA_ACCESS_TOKEN"),
+        brand_template_id=secret("CANVA_BRAND_TEMPLATE_ID"),
+    )
+    return adapter.autofill_export(
+        {
+            field_title: draft.title,
+            field_body: draft.body,
+            field_cta: secret("CANVA_CTA_TEXT", "Book your tyre check today"),
+        },
+        title=draft.title,
+    )
+
+
+def publish_live(draft: ContentDraft, design: dict) -> tuple[dict, ...]:
+    image_url = design.get("image_url") if design else None
+    if not image_url:
+        raise ProviderError("Generate the Canva design before publishing")
+    receipts: list[dict] = []
+    for destination in draft.destinations:
+        if destination == Destination.INSTAGRAM_FEED:
+            if not instagram_ready():
+                raise ProviderError("Instagram credentials are not configured")
+            receipts.append(
+                InstagramAdapter(
+                    access_token=secret("INSTAGRAM_ACCESS_TOKEN"),
+                    instagram_business_account_id=secret("INSTAGRAM_BUSINESS_ACCOUNT_ID"),
+                    api_version=secret("META_GRAPH_API_VERSION", "v21.0"),
+                ).publish_image(image_url, draft.body)
+            )
+        elif destination == Destination.INSTAGRAM_STORY:
+            if not instagram_ready():
+                raise ProviderError("Instagram credentials are not configured")
+            receipts.append(
+                InstagramAdapter(
+                    access_token=secret("INSTAGRAM_ACCESS_TOKEN"),
+                    instagram_business_account_id=secret("INSTAGRAM_BUSINESS_ACCOUNT_ID"),
+                    api_version=secret("META_GRAPH_API_VERSION", "v21.0"),
+                ).publish_story(image_url)
+            )
+        elif destination == Destination.WHATSAPP:
+            if not whatsapp_ready():
+                raise ProviderError("WhatsApp credentials and recipient phone are not configured")
+            receipts.append(
+                WhatsAppAdapter(
+                    access_token=secret("WHATSAPP_ACCESS_TOKEN"),
+                    phone_number_id=secret("WHATSAPP_PHONE_NUMBER_ID"),
+                    recipient_phone_number=secret("WHATSAPP_RECIPIENT_PHONE"),
+                    api_version=secret("META_GRAPH_API_VERSION", "v21.0"),
+                ).send_image(image_url, draft.body)
+            )
+        elif destination == Destination.GOOGLE_BUSINESS_PROFILE:
+            receipts.append({"provider": "google_business_profile", "status": "demo_only"})
+    return tuple(receipts)
 
 
 def initialize_state() -> None:
@@ -66,8 +135,8 @@ def initialize_state() -> None:
         }
     st.session_state.setdefault("queue", ApprovalQueue())
     st.session_state.setdefault("draft", None)
-    st.session_state.setdefault("generated_image", None)
-    st.session_state.setdefault("image_error", None)
+    st.session_state.setdefault("generated_design", None)
+    st.session_state.setdefault("design_error", None)
     st.session_state.setdefault("publisher", InMemoryPublisher())
     st.session_state.setdefault("publishing_log", [])
     st.session_state.setdefault("activity_log", [
@@ -130,12 +199,12 @@ def render_metric_row() -> None:
     draft = st.session_state.draft
     pending_draft = int(draft is not None and not draft.approved)
     published = len(st.session_state.publishing_log)
-    connected = sum(st.session_state.connections.values())
     cols = st.columns(4)
     cols[0].metric("Reviews to handle", str(pending_reviews), "Daily check")
     cols[1].metric("Content awaiting approval", str(pending_draft), "Human gate")
     cols[2].metric("Published this session", str(published), "Demo receipts")
-    cols[3].metric("Connections ready", f"{connected}/4", "Add credentials")
+    ready = int(canva_ready()) + int(instagram_ready()) + int(whatsapp_ready())
+    cols[3].metric("Connections ready", f"{ready}/3", "Canva + Meta")
 
 
 def render_overview() -> None:
@@ -147,7 +216,7 @@ def render_overview() -> None:
             st.subheader("Your agent team")
             agents = [
                 ("Review agent", "Checks GBP reviews, writes a distinct polite reply, and waits for approval.", "3 ready", "green"),
-                ("Content agent", "Creates a campaign caption, channel variants and an image prompt for Gemini or Canva.", "Draft on demand", "blue"),
+                ("Content agent", "Creates a campaign caption and a branded Canva design from your template.", "Draft on demand", "blue"),
                 ("Publishing agent", "Routes approved content to exactly the destinations you select.", "Approval locked", "orange"),
             ]
             for name, description, status, tone in agents:
@@ -232,37 +301,32 @@ def render_draft_preview(draft: ContentDraft) -> None:
         badge("Approved" if draft.approved else "Awaiting approval", "green" if draft.approved else "orange")
         st.markdown(f"### {draft.title}")
         st.write(draft.body)
-        st.markdown("**Image prompt for Gemini / Canva**")
+        st.markdown("**Canva design brief**")
         st.code(draft.image_prompt, language="text")
         st.markdown("**Publish to**")
         st.write(" · ".join(DESTINATION_LABELS[destination] for destination in draft.destinations) or "No channel selected")
-        st.caption("The prompt is retained as an audit trail. The image is generated automatically with Gemini when you submit the brief.")
+        st.caption("The design brief is retained as an audit trail. Canva creates the branded visual automatically from your configured brand template.")
 
 
-def render_generated_image(draft: ContentDraft) -> None:
+def render_generated_design(draft: ContentDraft) -> None:
     with st.container(border=True):
-        st.subheader("AI-generated image")
-        generated_image = st.session_state.generated_image
-        if generated_image is not None:
+        st.subheader("Canva-generated visual")
+        generated_design = st.session_state.generated_design
+        if generated_design is not None:
             st.image(
-                generated_image.image_bytes,
-                caption=f"Generated automatically with {generated_image.model}",
-                alt="AI-generated Malay Tyres social media creative",
+                generated_design["image_url"],
+                caption="Generated automatically from your Canva brand template",
+                alt="Canva-generated Malay Tyres social media creative",
                 width="stretch",
             )
-            st.download_button(
-                "Download generated image",
-                data=generated_image.image_bytes,
-                file_name=f"{draft.draft_id}.png",
-                mime=generated_image.mime_type,
-                icon=":material/download:",
-                width="stretch",
-            )
-        elif st.session_state.image_error:
-            st.warning(st.session_state.image_error, icon=":material/warning:")
-            st.caption("Add GEMINI_API_KEY to Streamlit secrets or the environment, then submit the brief again.")
+            if generated_design.get("design_url"):
+                st.link_button("Open and edit in Canva", generated_design["design_url"], icon=":material/edit:", width="stretch")
+            st.caption("Canva export URLs expire after 24 hours. Publish approved content during this trial window.")
+        elif st.session_state.design_error:
+            st.warning(st.session_state.design_error, icon=":material/warning:")
+            st.caption("Add CANVA_ACCESS_TOKEN and CANVA_BRAND_TEMPLATE_ID to Streamlit secrets, then submit the brief again.")
         else:
-            st.info("The image agent will generate the creative when you submit a brief.", icon=":material/image:")
+            st.info("Canva will generate the branded visual when you submit a brief.", icon=":material/image:")
 
 
 def render_content_studio() -> None:
@@ -280,7 +344,7 @@ def render_content_studio() -> None:
                 default=["Instagram feed", "WhatsApp"],
                 help="Select Instagram story when you want the image formatted for a story placement.",
             )
-            submitted = st.form_submit_button("Generate content + image prompt", type="primary", icon=":material/auto_awesome:", width="stretch")
+            submitted = st.form_submit_button("Generate content + Canva design", type="primary", icon=":material/auto_awesome:", width="stretch")
         if submitted:
             draft_id = f"draft-{len(st.session_state.activity_log) + 1}"
             draft = generate_content(topic, draft_id=draft_id)
@@ -293,24 +357,21 @@ def render_content_studio() -> None:
             )
             st.session_state.queue.add(draft)
             st.session_state.draft = draft
-            st.session_state.generated_image = None
-            st.session_state.image_error = None
-            add_activity("Content agent", f"Generated copy and an image prompt for {topic}")
-            aspect_ratio = "9:16" if Destination.INSTAGRAM_STORY in draft.destinations else "1:1"
-            try:
-                with st.spinner("Generating the image automatically with Gemini..."):
-                    st.session_state.generated_image = GeminiImageGenerator(gemini_api_key()).generate(
-                        draft.image_prompt,
-                        aspect_ratio,
-                    )
-                add_activity("Image agent", f"Generated a {aspect_ratio} creative with Gemini")
-                st.success("Draft and image created automatically. Review both below.", icon=":material/check_circle:")
-            except ValueError as exc:
-                st.session_state.image_error = str(exc)
-                st.warning("The copy was created, but the image could not be generated yet.", icon=":material/warning:")
-            except Exception as exc:
-                st.session_state.image_error = explain_image_error(exc)
-                st.warning("The copy was created, but Gemini did not return an image.", icon=":material/warning:")
+            st.session_state.generated_design = None
+            st.session_state.design_error = None
+            add_activity("Content agent", f"Generated copy and a Canva design brief for {topic}")
+            if canva_ready():
+                try:
+                    with st.spinner("Creating the branded visual automatically in Canva..."):
+                        st.session_state.generated_design = generate_canva_design(draft)
+                    add_activity("Canva agent", "Created and exported a branded visual from the Canva template")
+                    st.success("Draft and Canva design created automatically. Review both below.", icon=":material/check_circle:")
+                except ProviderError as exc:
+                    st.session_state.design_error = str(exc)
+                    st.warning("The copy was created, but Canva did not return a design.", icon=":material/warning:")
+            else:
+                st.session_state.design_error = "Canva is not configured yet. Add CANVA_ACCESS_TOKEN and CANVA_BRAND_TEMPLATE_ID to create the design automatically."
+                st.warning("The copy was created. Connect Canva to generate the visual automatically.", icon=":material/warning:")
 
     draft = st.session_state.draft
     if draft is None:
@@ -319,7 +380,7 @@ def render_content_studio() -> None:
 
     st.space("small")
     render_draft_preview(draft)
-    render_generated_image(draft)
+    render_generated_design(draft)
     with st.container(border=True):
         st.subheader("2. Review and approve")
         edited_title = st.text_input("Title", value=draft.title, key="draft_title")
@@ -347,48 +408,47 @@ def render_content_studio() -> None:
         else:
             st.success("Approval recorded. This publish action routes only to the selected destinations.", icon=":material/lock_open:")
         if st.button("Publish approved content", type="primary", disabled=not draft.approved, icon=":material/send:", width="stretch"):
-            receipts = publish_approved(draft, st.session_state.publisher)
-            st.session_state.publishing_log.extend(receipts)
-            add_activity("Publishing agent", f"Routed approved campaign to {len(receipts)} selected channel(s)")
-            st.success(f"Demo publish complete: {len(receipts)} receipt(s) created. No external post was sent.", icon=":material/check_circle:")
-            for receipt in receipts:
-                st.code(receipt, language="text")
+            try:
+                receipts = publish_live(draft, st.session_state.generated_design)
+                st.session_state.publishing_log.extend(receipts)
+                add_activity("Publishing agent", f"Routed approved campaign to {len(receipts)} selected channel(s)")
+                st.success(f"Publish complete: {len(receipts)} receipt(s) created.", icon=":material/check_circle:")
+                for receipt in receipts:
+                    st.json(receipt)
+            except ProviderError as exc:
+                st.error(str(exc), icon=":material/error:")
 
 
 def render_connections() -> None:
     st.header("Connections and guardrails")
-    st.write("Gemini image generation is live when a key is configured. The remaining publishing connectors are still safe demo adapters.")
-    st.warning("This build does not make live calls to Google Business Profile, Canva, Instagram or WhatsApp. Gemini is the exception: submitting a content brief calls the configured Gemini image model.", icon=":material/shield:")
+    st.write("Configure Canva, Instagram and WhatsApp once in Streamlit secrets. The content studio then creates the Canva visual and publishes only after approval.")
+    st.warning("Canva's public REST API does not expose Magic Media text-to-image generation. This app uses Canva's supported brand-template autofill/export flow, so your Canva brand template should already contain the visual treatment/background.", icon=":material/info:")
     descriptions = {
         "Google Business Profile": "Read new reviews and publish approved replies through Google OAuth.",
-        "Gemini / Antigravity": "Generate campaign variations and image prompts using your chosen AI provider.",
-        "Canva": "Turn the approved image prompt into a branded creative using a Canva connection.",
-        "Instagram + WhatsApp": "Publish approved feed, story and WhatsApp assets to selected destinations.",
+        "Canva": "Create and export the branded visual from a Canva brand template.",
+        "Instagram": "Publish approved feed posts and stories through the Instagram Graph API.",
+        "WhatsApp": "Send approved image messages through the WhatsApp Cloud API.",
     }
     for name, description in descriptions.items():
         with st.container(border=True):
-            key_ready = name == "Gemini / Antigravity" and bool(gemini_api_key())
-            status = key_ready or st.session_state.connections[name]
+            key_ready = {
+                "Canva": canva_ready(),
+                "Instagram": instagram_ready(),
+                "WhatsApp": whatsapp_ready(),
+            }.get(name, False)
             left, right = st.columns([3, 1], vertical_alignment="center")
             with left:
                 st.markdown(f"**{name}**")
                 st.caption(description)
             with right:
-                if name == "Gemini / Antigravity":
-                    badge("API key ready" if key_ready else "Needs API key", "green" if key_ready else "orange")
-                else:
-                    badge("Connected" if status else "Not connected", "green" if status else "gray")
-                    if st.button("Disconnect" if status else "Connect demo", key=f"connection_{name}"):
-                        st.session_state.connections[name] = not status
-                        add_activity("System", f"{'Connected' if not status else 'Disconnected'} {name}")
-                        st.rerun()
+                badge("Configured" if key_ready else "Needs secrets", "green" if key_ready else "orange")
     st.space("small")
     with st.container(border=True):
         st.subheader("Production checklist")
-        st.markdown(":material/check_box_outline_blank: Add OAuth/API credentials with `st.secrets`")
-        st.markdown(":material/check_box_outline_blank: Replace the in-memory adapters with provider clients")
-        st.markdown(":material/check_box_outline_blank: Add a durable scheduler for the daily review check")
-        st.markdown(":material/check_box_outline_blank: Confirm Instagram story image dimensions and WhatsApp template rules")
+        st.markdown(":material/check_box_outline_blank: Add Canva access token and brand template ID")
+        st.markdown(":material/check_box_outline_blank: Add Instagram Graph API token and business account ID")
+        st.markdown(":material/check_box_outline_blank: Add WhatsApp Cloud API token, phone ID and recipient number")
+        st.markdown(":material/check_box_outline_blank: Confirm the Canva template field names: TITLE, BODY and CTA")
 
 
 initialize_state()
