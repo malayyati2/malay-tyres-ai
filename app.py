@@ -1079,8 +1079,12 @@ def render_connections() -> None:
             "Only continue through an Embedded Signup flow explicitly configured for WhatsApp Business App coexistence.",
             icon=":material/verified_user:",
         )
+        # Accept either Streamlit secret name used during setup.
         meta_app_id = secret("META_APP_ID")
-        signup_config_id = secret("WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID")
+        signup_config_id = (
+            secret("META_CONFIG_ID")
+            or secret("WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID")
+        )
         st.markdown("**Required Meta setup**")
         st.markdown(
             "1. In [Meta for Developers](https://developers.facebook.com/apps/), open your existing app and add/configure WhatsApp.  \n"
