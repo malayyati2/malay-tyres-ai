@@ -65,12 +65,49 @@ def oauth_db_init() -> None:
     with sqlite3.connect(OAUTH_DB_PATH, timeout=10) as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS oauth_tokens (provider TEXT PRIMARY KEY, access_token TEXT NOT NULL, refresh_token TEXT NOT NULL DEFAULT '', expires_at REAL NOT NULL DEFAULT 0)")
 
+def _supabase_token_config() -> tuple[str, str]:
+    base_url = secret("SUPABASE_URL").rstrip("/")
+    service_key = secret("SUPABASE_SERVICE_ROLE_KEY")
+    return base_url, service_key
+
 def oauth_token_save(provider: str, access_token: str, refresh_token: str = "", expires_at: float = 0) -> None:
+    # Supabase is the durable store on Streamlit Cloud; /tmp SQLite is a local fallback only.
+    base_url, service_key = _supabase_token_config()
+    if base_url and service_key:
+        try:
+            response = requests.post(
+                f"{base_url}/rest/v1/oauth_tokens",
+                headers={"apikey": service_key, "Authorization": f"Bearer {service_key}",
+                         "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal"},
+                json={"provider": provider, "access_token": access_token,
+                      "refresh_token": refresh_token, "expires_at": float(expires_at or 0)},
+                timeout=15,
+            )
+            response.raise_for_status()
+            return
+        except Exception:
+            pass
     oauth_db_init()
     with sqlite3.connect(OAUTH_DB_PATH, timeout=10) as conn:
         conn.execute("INSERT OR REPLACE INTO oauth_tokens(provider, access_token, refresh_token, expires_at) VALUES (?, ?, ?, ?)", (provider, access_token, refresh_token, float(expires_at or 0)))
 
 def oauth_token_get(provider: str) -> tuple[str, str, float]:
+    base_url, service_key = _supabase_token_config()
+    if base_url and service_key:
+        try:
+            response = requests.get(
+                f"{base_url}/rest/v1/oauth_tokens",
+                headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"},
+                params={"provider": f"eq.{provider}", "select": "access_token,refresh_token,expires_at", "limit": "1"},
+                timeout=15,
+            )
+            response.raise_for_status()
+            rows = response.json()
+            if rows:
+                row = rows[0]
+                return str(row.get("access_token", "")), str(row.get("refresh_token", "")), float(row.get("expires_at", 0) or 0)
+        except Exception:
+            pass
     try:
         oauth_db_init()
         with sqlite3.connect(OAUTH_DB_PATH, timeout=10) as conn:
@@ -311,10 +348,10 @@ def sync_google_reviews() -> int:
             reply_text = existing_reply
             status = "Published"
         elif prior and prior.get("status") in ("Ready to review", "Approved for publishing"):
-            reply_text = prior.get("reply", generate_reply(review))
+            reply_text = prior.get("reply", generate_review_reply(review))
             status = prior.get("status", "Ready to review")
         else:
-            reply_text = generate_reply(review)
+            reply_text = generate_review_reply(review)
             status = "Ready to review"
         synced[review_id] = {"review": review, "reply": reply_text, "status": status}
         review_names[review_id] = review_name
@@ -332,11 +369,112 @@ def publish_google_review_reply(review_id: str, reply: str) -> None:
 
 
 def canva_access_token() -> str:
-    return str(st.session_state.get("canva_access_token") or oauth_token_get("canva")[0] or secret("CANVA_ACCESS_TOKEN"))
+    stored_access, stored_refresh, stored_expiry = oauth_token_get("canva")
+    token = str(st.session_state.get("canva_access_token") or stored_access or secret("CANVA_ACCESS_TOKEN"))
+    refresh_token = str(st.session_state.get("canva_refresh_token") or stored_refresh or secret("CANVA_REFRESH_TOKEN"))
+    expires_at = float(st.session_state.get("canva_token_expires_at", 0) or stored_expiry or 0)
+    if token and expires_at and time.time() >= expires_at - 60:
+        if not refresh_token:
+            return ""
+        client_id = secret("CANVA_CLIENT_ID")
+        client_secret = secret("CANVA_CLIENT_SECRET")
+        basic = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+        response = requests.post(
+            "https://api.canva.com/rest/v1/oauth/token",
+            headers={"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"},
+            data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+            timeout=30,
+        )
+        if not response.ok:
+            return ""
+        data = response.json()
+        token = str(data.get("access_token", ""))
+        refresh_token = str(data.get("refresh_token") or refresh_token)
+        expires_at = time.time() + int(data.get("expires_in", 3600))
+        st.session_state.canva_access_token = token
+        st.session_state.canva_refresh_token = refresh_token
+        st.session_state.canva_token_expires_at = expires_at
+        oauth_token_save("canva", token, refresh_token, expires_at)
+    return token
 
 
 def gemini_api_key() -> str:
     return secret("GEMINI_API_KEY")
+
+
+def generate_review_reply(review) -> str:
+    """Write a service-specific reply without ever using the reviewer's name."""
+    review_text = str(getattr(review, "text", "") or "").strip()
+    rating = int(getattr(review, "rating", 5) or 5)
+    lowered = review_text.casefold()
+
+    # Use the language model when configured, with strict grounding in the review.
+    api_key = gemini_api_key()
+    if api_key and review_text and review_text != "(Rating-only review)":
+        try:
+            model = secret("GEMINI_MODEL", "gemini-2.5-flash")
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            prompt = (
+                "Write one short, polite Google Business Profile owner reply for Malay Tyres, Ujjain. "
+                "CRITICAL RULES: Never use, repeat, or infer the reviewer's name. Start exactly with 'Dear Sir/Ma’am,'. "
+                "Mention the exact service the reviewer actually mentions (examples: wheel alignment, Teflon coating, "
+                "wheel balancing, tyre rotation, tyre inspection, car washing, interior cleaning, headlight cleaning, "
+                "rim work, engine work, suspension work, brake work, general mechanical work). Do not mention tyres "
+                "or any service that the review does not support. If no service is named, thank them generally without "
+                "guessing a service. Match the sentiment and rating; for negative feedback, apologize and invite them "
+                "to contact the shop to resolve it without arguing. Keep it natural, 2 sentences maximum, no hashtags.\n\n"
+                f"Star rating: {rating}/5\nReview text: {review_text}"
+            )
+            response = requests.post(
+                endpoint, params={"key": api_key},
+                json={"contents": [{"parts": [{"text": prompt}]}],
+                     "generationConfig": {"temperature": 0.25, "maxOutputTokens": 160}},
+                timeout=20,
+            )
+            if response.ok:
+                data = response.json()
+                candidates = data.get("candidates", [])
+                text = "".join(part.get("text", "") for part in candidates[0].get("content", {}).get("parts", [])) if candidates else ""
+                text = text.strip().strip('"')
+                # Defensively strip any accidental name-like greeting or wrong greeting.
+                if text:
+                    if text.casefold().startswith(("dear sir", "dear ma'am", "dear madam", "hello", "hi ")):
+                        text = text.split("\n", 1)[-1].strip() if text.casefold().startswith(("hello", "hi ")) else text
+                    if not text.casefold().startswith(("dear sir", "dear ma’am", "dear ma'am")):
+                        text = "Dear Sir/Ma’am,\n\n" + text
+                    return text
+        except Exception:
+            pass
+
+    # Reliable fallback: only mention a service when review wording identifies it.
+    service_patterns = [
+        (("alignment", "wheel align", "wheel-alignment"), "wheel alignment"),
+        (("teflon",), "Teflon coating"),
+        (("balancing", "wheel balance", "wheel-balancing"), "wheel balancing"),
+        (("rotation", "tyre rotate", "tire rotate"), "tyre rotation"),
+        (("inspection", "check-up", "checkup"), "vehicle inspection"),
+        (("car wash", "washing", "washed my car"), "car washing"),
+        (("interior cleaning", "interior clean", "car interior"), "interior cleaning"),
+        (("headlight", "head light"), "headlight cleaning"),
+        (("rim repair", "rim work", "alloy repair", "rim through"), "rim work"),
+        (("suspension",), "suspension work"),
+        (("brake",), "brake work"),
+        (("engine",), "engine work"),
+        (("mechanical", "general work", "repair work"), "mechanical work"),
+        (("tyre", "tire"), "tyre service"),
+    ]
+    service = next((label for terms, label in service_patterns if any(term in lowered for term in terms)), "")
+    if rating >= 4:
+        if service:
+            return f"Dear Sir/Ma’am, thank you for your kind feedback about our {service}. We truly appreciate your trust in Malay Tyres and look forward to serving you again."
+        return "Dear Sir/Ma’am, thank you for your valuable feedback and support. We truly appreciate your trust in Malay Tyres and look forward to serving you again."
+    if rating == 3:
+        if service:
+            return f"Dear Sir/Ma’am, thank you for sharing your feedback about our {service}. We’ll use your comments to improve and would appreciate the opportunity to serve you better."
+        return "Dear Sir/Ma’am, thank you for your feedback. We’ll use your comments to improve and would appreciate the opportunity to serve you better."
+    if service:
+        return f"Dear Sir/Ma’am, we’re sorry your experience with our {service} did not meet expectations. Please contact Malay Tyres so we can understand the issue and work to make it right."
+    return "Dear Sir/Ma’am, we’re sorry your experience did not meet expectations. Please contact Malay Tyres so we can understand the issue and work to make it right."
 
 
 def canva_redirect_uri() -> str:
@@ -393,6 +531,7 @@ def handle_canva_oauth_callback() -> None:
         expires_at = time.time() + int(token_data.get("expires_in", 3600))
         st.session_state.canva_access_token = access_token
         st.session_state.canva_refresh_token = refresh_token
+        st.session_state.canva_token_expires_at = expires_at
         oauth_token_save("canva", access_token, refresh_token, expires_at)
         st.session_state.canva_oauth_error = ""
     except Exception as exc:
@@ -520,7 +659,7 @@ def initialize_state() -> None:
         st.session_state.reviews = {
             review.review_id: {
                 "review": review,
-                "reply": generate_reply(review),
+                "reply": generate_review_reply(review),
                 "status": "Ready to review",
             }
             for review in SAMPLE_REVIEWS
@@ -638,7 +777,7 @@ def render_overview() -> None:
         if st.button("Run review check now", type="primary", icon=":material/refresh:"):
             st.session_state.review_run_at = now_label()
             for item in st.session_state.reviews.values():
-                item["reply"] = generate_reply(item["review"])
+                item["reply"] = generate_review_reply(item["review"])
                 item["status"] = "Ready to review"
             add_activity("Review agent", "Checked sample GBP reviews and refreshed polite replies")
             st.success("Review check completed. Replies are ready for your approval.", icon=":material/check_circle:")
@@ -698,7 +837,7 @@ def render_reviews() -> None:
     if st.button("Refresh suggested replies", icon=":material/auto_awesome:"):
         for item in st.session_state.reviews.values():
             if item.get("status") != "Published":
-                item["reply"] = generate_reply(item["review"])
+                item["reply"] = generate_review_reply(item["review"])
                 item["status"] = "Ready to review"
         add_activity("Review agent", "Refreshed suggested replies without publishing")
         st.rerun()
@@ -917,7 +1056,7 @@ def render_connections() -> None:
         st.subheader("Connect Canva with OAuth")
         st.caption("Use your Canva Client ID and Client secret here through Streamlit secrets. The secret stays on the server; only the Canva authorization page opens in your browser.")
         if canva_access_token():
-            st.success("Canva access token is available for this session.", icon=":material/check_circle:")
+            st.success("Canva is connected. The app will reuse the saved authorization and refresh it when Canva allows it.", icon=":material/check_circle:")
         elif secret("CANVA_CLIENT_ID") and secret("CANVA_CLIENT_SECRET"):
             authorization_url = canva_authorization_url()
             if authorization_url:
