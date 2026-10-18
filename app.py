@@ -1068,6 +1068,42 @@ def render_connections() -> None:
             st.error(st.session_state.canva_oauth_error, icon=":material/error:")
     st.space("small")
     with st.container(border=True):
+        st.subheader("Connect WhatsApp Business App (Coexistence)")
+        st.write(
+            "This section is intentionally a setup checklist, not a fake connection button. "
+            "The current app can send through a configured Cloud API token, but it does not yet "
+            "implement Meta Embedded Signup for keeping the same number in the WhatsApp Business app."
+        )
+        st.warning(
+            "Do not register, migrate, remove, or disconnect your existing phone number using the standard Cloud API setup. "
+            "Only continue through an Embedded Signup flow explicitly configured for WhatsApp Business App coexistence.",
+            icon=":material/verified_user:",
+        )
+        meta_app_id = secret("META_APP_ID")
+        signup_config_id = secret("WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID")
+        st.markdown("**Required Meta setup**")
+        st.markdown(
+            "1. In [Meta for Developers](https://developers.facebook.com/apps/), open your existing app and add/configure WhatsApp.  \n"
+            "2. Configure Facebook Login for Business / Embedded Signup using Meta's current supported configuration.  \n"
+            "3. Ensure the flow is explicitly set to connect an existing **WhatsApp Business App** number (coexistence), not standard API migration.  \n"
+            "4. Configure the required HTTPS callback/webhook backend and subscribe the app to WhatsApp webhook events.  \n"
+            "5. Complete Meta's required permissions, review, and provider/tech-provider onboarding steps before using this for customers."
+        )
+        st.caption("Meta's official Embedded Signup documentation: https://www.postman.com/meta/whatsapp-business-platform/documentation/du6gzjv/embedded-signup")
+        c1, c2 = st.columns(2)
+        with c1:
+            badge("Meta App ID found" if meta_app_id else "META_APP_ID missing", "green" if meta_app_id else "orange")
+        with c2:
+            badge("Signup Config ID found" if signup_config_id else "Signup Config ID missing", "green" if signup_config_id else "orange")
+        st.info(
+            "These IDs alone do not connect WhatsApp. A secure backend must complete the signup code exchange, store credentials, "
+            "verify webhook requests, and handle incoming messages. This app will not mark WhatsApp as connected until that flow is implemented and tested.",
+            icon=":material/info:",
+        )
+        st.link_button("Open Meta for Developers", "https://developers.facebook.com/apps/", width="stretch")
+
+    st.space("small")
+    with st.container(border=True):
         st.subheader("Production checklist")
         st.markdown(":material/check_box_outline_blank: Add GEMINI_API_KEY for AI-written campaign copy")
         st.markdown(":material/check_box_outline_blank: Add Canva access token and brand template ID")
