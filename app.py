@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 from datetime import datetime
+import base64
+import hashlib
+import hmac
 import os
+import sqlite3
+import secrets as py_secrets
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
+
+import requests
 
 import streamlit as st
 
@@ -16,7 +24,6 @@ from tyre_agents.core import (
     generate_reply,
     publish_approved,
 )
-from tyre_agents.canva_oauth import create_pkce_request, exchange_code
 from tyre_agents.providers import CanvaAdapter, InstagramAdapter, ProviderError, WhatsAppAdapter
 from tyre_agents.gemini_text import GeminiTextGenerator
 
@@ -49,9 +56,57 @@ def secret(name: str, default: str = "") -> str:
         return default
 
 
-def canva_access_token() -> str:
-    return str(st.session_state.get("canva_access_token") or secret("CANVA_ACCESS_TOKEN"))
+def _canva_store_path() -> str:
+    # Shared by Streamlit browser sessions on the same running app instance.
+    # Streamlit Cloud may clear /tmp when the app restarts; users can authorize again.
+    return "/tmp/malay_tyres_canva_oauth.sqlite3"
 
+
+def _canva_store_init() -> None:
+    with sqlite3.connect(_canva_store_path(), timeout=10) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS oauth_state (state TEXT PRIMARY KEY, verifier TEXT NOT NULL, created_at INTEGER NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS oauth_tokens (id INTEGER PRIMARY KEY CHECK (id = 1), access_token TEXT NOT NULL, refresh_token TEXT NOT NULL DEFAULT '')")
+
+
+def _canva_store_state(state: str, verifier: str) -> None:
+    import time
+    _canva_store_init()
+    with sqlite3.connect(_canva_store_path(), timeout=10) as conn:
+        # Remove stale one-time states after 15 minutes.
+        conn.execute("DELETE FROM oauth_state WHERE created_at < ?", (int(time.time()) - 900,))
+        conn.execute("INSERT OR REPLACE INTO oauth_state(state, verifier, created_at) VALUES (?, ?, ?)", (state, verifier, int(time.time())))
+
+
+def _canva_get_verifier(state: str) -> str:
+    _canva_store_init()
+    with sqlite3.connect(_canva_store_path(), timeout=10) as conn:
+        row = conn.execute("SELECT verifier FROM oauth_state WHERE state = ?", (state,)).fetchone()
+        if row:
+            conn.execute("DELETE FROM oauth_state WHERE state = ?", (state,))
+            return str(row[0])
+    return ""
+
+
+def _canva_store_tokens(access_token: str, refresh_token: str = "") -> None:
+    _canva_store_init()
+    with sqlite3.connect(_canva_store_path(), timeout=10) as conn:
+        conn.execute("INSERT OR REPLACE INTO oauth_tokens(id, access_token, refresh_token) VALUES (1, ?, ?)", (access_token, refresh_token))
+
+
+def canva_access_token() -> str:
+    session_token = str(st.session_state.get("canva_access_token") or "")
+    if session_token:
+        return session_token
+    configured_token = secret("CANVA_ACCESS_TOKEN")
+    if configured_token:
+        return configured_token
+    try:
+        _canva_store_init()
+        with sqlite3.connect(_canva_store_path(), timeout=10) as conn:
+            row = conn.execute("SELECT access_token FROM oauth_tokens WHERE id = 1").fetchone()
+            return str(row[0]) if row else ""
+    except Exception:
+        return ""
 
 def gemini_api_key() -> str:
     return secret("GEMINI_API_KEY")
@@ -64,40 +119,135 @@ def canva_redirect_uri() -> str:
     return "http://localhost:8501"
 
 
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _canva_state_and_verifier(client_secret: str) -> tuple[str, str, str]:
+    """Create a signed, stateless OAuth state and a reproducible PKCE verifier.
+
+    This avoids relying on Streamlit session state or local disk, which may not
+    survive Canva opening a new tab or Streamlit Cloud routing the callback to
+    a different app instance.
+    """
+    nonce = _b64url(py_secrets.token_bytes(32))
+    signature = _b64url(hmac.new(client_secret.encode("utf-8"), ("state:" + nonce).encode("ascii"), hashlib.sha256).digest())
+    state = nonce + "." + signature
+    verifier = _b64url(hmac.new(client_secret.encode("utf-8"), ("verifier:" + nonce).encode("ascii"), hashlib.sha256).digest())
+    challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
+    return state, verifier, challenge
+
+
+def _canva_verifier_from_state(state: str, client_secret: str) -> str:
+    """Validate OAuth state and reproduce its PKCE verifier without server storage."""
+    try:
+        nonce, supplied_signature = state.split(".", 1)
+    except ValueError:
+        return ""
+    expected_signature = _b64url(hmac.new(client_secret.encode("utf-8"), ("state:" + nonce).encode("ascii"), hashlib.sha256).digest())
+    if not hmac.compare_digest(supplied_signature, expected_signature):
+        return ""
+    return _b64url(hmac.new(client_secret.encode("utf-8"), ("verifier:" + nonce).encode("ascii"), hashlib.sha256).digest())
+
+
 def handle_canva_oauth_callback() -> None:
+    """Exchange Canva's callback code using the verifier created for that exact request."""
     code = st.query_params.get("code")
     returned_state = st.query_params.get("state")
-    if not code or not returned_state or st.session_state.get("canva_last_code") == code:
+    oauth_error = st.query_params.get("error")
+    if oauth_error:
+        st.session_state.canva_oauth_error = f"Canva authorization was not completed ({oauth_error}). Start again from Connections."
+        st.query_params.clear()
         return
-    st.session_state.canva_last_code = code
-    expected_state = st.session_state.get("canva_oauth_state")
-    verifier = st.session_state.get("canva_code_verifier")
-    if not expected_state or returned_state != expected_state or not verifier:
-        st.session_state.canva_oauth_error = "Canva OAuth state validation failed. Start the connection again."
+    if not code or not returned_state:
         return
+    if st.session_state.get("canva_last_code") == code:
+        return
+
+    # Validate signed state and reproduce the PKCE verifier without relying on
+    # session state, SQLite, /tmp persistence, or a particular Cloud instance.
+    client_id = secret("CANVA_CLIENT_ID")
+    client_secret = secret("CANVA_CLIENT_SECRET")
+    state_secret = secret("CANVA_OAUTH_STATE_SECRET") or client_secret
+    verifier = _canva_verifier_from_state(str(returned_state), state_secret)
+    if not verifier:
+        st.session_state.canva_oauth_error = "Canva OAuth state validation failed. The callback state is invalid or the Canva Client Secret changed during authorization. Return to Connections and click Authorize Canva again."
+        st.query_params.clear()
+        return
+
     try:
-        token_response = exchange_code(
-            code,
-            verifier,
-            secret("CANVA_CLIENT_ID"),
-            secret("CANVA_CLIENT_SECRET"),
-            canva_redirect_uri(),
+        redirect_uri = canva_redirect_uri()
+        basic = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+        response = requests.post(
+            "https://api.canva.com/rest/v1/oauth/token",
+            headers={"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": verifier,
+                "redirect_uri": redirect_uri,
+            },
+            timeout=30,
         )
-        st.session_state.canva_access_token = str(token_response["access_token"])
-        st.session_state.canva_refresh_token = str(token_response.get("refresh_token", ""))
+        if not response.ok:
+            # Do not display request headers, client secret, or token contents.
+            detail = "Canva rejected the token exchange. Verify the current Client ID/secret and that the redirect URI matches exactly in Canva and Streamlit."
+            try:
+                api_error = response.json().get("error")
+                if api_error:
+                    detail += f" Error: {api_error}."
+            except Exception:
+                pass
+            raise RuntimeError(detail)
+        token_response = response.json()
+        access_token = token_response.get("access_token")
+        if not access_token:
+            raise RuntimeError("Canva did not return an access token. Check the OAuth app settings and scopes.")
+        refresh_token = str(token_response.get("refresh_token", ""))
+        st.session_state.canva_access_token = str(access_token)
+        st.session_state.canva_refresh_token = refresh_token
+        _canva_store_tokens(str(access_token), refresh_token)
+        st.session_state.canva_last_code = code
         st.session_state.canva_oauth_error = ""
-    except Exception:
-        st.session_state.canva_oauth_error = "Canva OAuth token exchange failed. Check the Client ID, Client secret and redirect URL."
+        st.session_state.canva_oauth_state = ""
+        st.session_state.canva_code_verifier = ""
+        st.query_params.clear()
+    except Exception as exc:
+        message = str(exc)
+        st.session_state.canva_oauth_error = message if message.startswith("Canva ") else "Canva token exchange failed. Verify the Client ID, Client secret, redirect URI, and app scopes in Canva Developer Portal."
+        st.query_params.clear()
+
+
+def secrets_compare(left: str, right: str) -> bool:
+    """Constant-time comparison for OAuth state values."""
+    import hmac
+    return hmac.compare_digest(str(left), str(right))
 
 
 def canva_authorization_url() -> str | None:
     client_id = secret("CANVA_CLIENT_ID")
     if not client_id or not secret("CANVA_CLIENT_SECRET"):
         return None
-    request = create_pkce_request(client_id, canva_redirect_uri())
-    st.session_state.canva_oauth_state = request.state
-    st.session_state.canva_code_verifier = request.code_verifier
-    return request.authorization_url
+    # Stateless signed state: safe across new tabs and Streamlit Cloud instances.
+    # The same stable key must be used in authorization and callback.
+    state_secret = secret("CANVA_OAUTH_STATE_SECRET") or secret("CANVA_CLIENT_SECRET")
+    state, verifier, challenge = _canva_state_and_verifier(state_secret)
+    st.session_state.canva_oauth_state = state
+    st.session_state.canva_code_challenge = challenge
+    scopes = secret(
+        "CANVA_SCOPES",
+        "brandtemplate:content:read brandtemplate:content:write brandtemplate:meta:read design:content:read design:content:write design:meta:read asset:read asset:write profile:read",
+    )
+    params = {
+        "code_challenge_method": "s256",
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": canva_redirect_uri(),
+        "scope": scopes,
+        "state": state,
+        "code_challenge": challenge,
+    }
+    return "https://www.canva.com/api/oauth/authorize?" + urlencode(params)
 
 
 def canva_ready() -> bool:
@@ -547,15 +697,19 @@ def render_connections() -> None:
     with st.container(border=True):
         st.subheader("Connect Canva with OAuth")
         st.caption("Use your Canva Client ID and Client secret here through Streamlit secrets. The secret stays on the server; only the Canva authorization page opens in your browser.")
-        if canva_access_token():
-            st.success("Canva access token is available for this session.", icon=":material/check_circle:")
+        if canva_access_token() and secret("CANVA_BRAND_TEMPLATE_ID"):
+            st.success("Canva is configured: access token and Brand Template ID are available.", icon=":material/check_circle:")
         elif secret("CANVA_CLIENT_ID") and secret("CANVA_CLIENT_SECRET"):
+            if canva_access_token() and not secret("CANVA_BRAND_TEMPLATE_ID"):
+                st.warning("A Canva access token exists, but CANVA_BRAND_TEMPLATE_ID is missing.")
+            elif not canva_access_token():
+                st.info("Canva credentials are present. Click Authorize Canva to obtain an access token for this session.")
             authorization_url = canva_authorization_url()
             if authorization_url:
                 st.link_button("Authorize Canva", authorization_url, icon=":material/login:", width="stretch")
                 st.caption(f"Canva must redirect back to: {canva_redirect_uri()}")
         else:
-            st.info("Add CANVA_CLIENT_ID, CANVA_CLIENT_SECRET and CANVA_REDIRECT_URI to Streamlit secrets, then this button will appear.", icon=":material/key:")
+            st.info("Add CANVA_CLIENT_ID and CANVA_CLIENT_SECRET to Streamlit secrets. Also set CANVA_REDIRECT_URI and CANVA_BRAND_TEMPLATE_ID.", icon=":material/key:")
         if st.session_state.canva_oauth_error:
             st.error(st.session_state.canva_oauth_error, icon=":material/error:")
     st.space("small")
