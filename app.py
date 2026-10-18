@@ -264,8 +264,9 @@ def google_get_reviews() -> list[dict]:
         st.session_state.google_account_name = account_name
         st.session_state.google_location_name = location_name
         st.session_state.google_location_title = selected_location.get("title", "Malay Tyres")
-    # Reviews API expects the complete parent resource: accounts/{id}/locations/{id}/reviews.
-    url = f"{GOOGLE_REVIEWS_API}/{location_name}/reviews"
+    # The Reviews API requires the full parent resource, including accounts/{id}.
+    # Business Information API returns only locations/{id}, so combine it with the account name.
+    url = f"{GOOGLE_REVIEWS_API}/{account_name}/{location_name}/reviews"
     all_reviews = []
     page_token = None
     for _ in range(10):
