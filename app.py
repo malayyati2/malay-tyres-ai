@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime
-import base64
-import hashlib
-import hmac
-import os
-import sqlite3
-import secrets as py_secrets
 from urllib.parse import urlencode
-from zoneinfo import ZoneInfo
+import secrets as random_secrets
+import time
+import os
 
 import requests
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
@@ -24,6 +21,7 @@ from tyre_agents.core import (
     generate_reply,
     publish_approved,
 )
+from tyre_agents.canva_oauth import create_pkce_request, exchange_code
 from tyre_agents.providers import CanvaAdapter, InstagramAdapter, ProviderError, WhatsAppAdapter
 from tyre_agents.gemini_text import GeminiTextGenerator
 
@@ -56,57 +54,216 @@ def secret(name: str, default: str = "") -> str:
         return default
 
 
-def _canva_store_path() -> str:
-    # Shared by Streamlit browser sessions on the same running app instance.
-    # Streamlit Cloud may clear /tmp when the app restarts; users can authorize again.
-    return "/tmp/malay_tyres_canva_oauth.sqlite3"
+# Google Business Profile API configuration. Tokens remain in this Streamlit session.
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_ACCOUNT_API = "https://mybusinessaccountmanagement.googleapis.com/v1"
+GOOGLE_INFO_API = "https://mybusinessbusinessinformation.googleapis.com/v1"
+GOOGLE_REVIEWS_API = "https://mybusiness.googleapis.com/v4"
+GOOGLE_SCOPE = "https://www.googleapis.com/auth/business.manage"
 
 
-def _canva_store_init() -> None:
-    with sqlite3.connect(_canva_store_path(), timeout=10) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS oauth_state (state TEXT PRIMARY KEY, verifier TEXT NOT NULL, created_at INTEGER NOT NULL)")
-        conn.execute("CREATE TABLE IF NOT EXISTS oauth_tokens (id INTEGER PRIMARY KEY CHECK (id = 1), access_token TEXT NOT NULL, refresh_token TEXT NOT NULL DEFAULT '')")
+def google_redirect_uri() -> str:
+    configured = secret("GOOGLE_REDIRECT_URI")
+    if configured:
+        return configured
+    return "https://malay-tyres-ai-nfwrfxd6jkbugixs4e7npm.streamlit.app/"
 
 
-def _canva_store_state(state: str, verifier: str) -> None:
-    import time
-    _canva_store_init()
-    with sqlite3.connect(_canva_store_path(), timeout=10) as conn:
-        # Remove stale one-time states after 15 minutes.
-        conn.execute("DELETE FROM oauth_state WHERE created_at < ?", (int(time.time()) - 900,))
-        conn.execute("INSERT OR REPLACE INTO oauth_state(state, verifier, created_at) VALUES (?, ?, ?)", (state, verifier, int(time.time())))
+def google_connected() -> bool:
+    return bool(st.session_state.get("google_access_token"))
 
 
-def _canva_get_verifier(state: str) -> str:
-    _canva_store_init()
-    with sqlite3.connect(_canva_store_path(), timeout=10) as conn:
-        row = conn.execute("SELECT verifier FROM oauth_state WHERE state = ?", (state,)).fetchone()
-        if row:
-            conn.execute("DELETE FROM oauth_state WHERE state = ?", (state,))
-            return str(row[0])
-    return ""
+def google_authorization_url() -> str | None:
+    client_id = secret("GOOGLE_CLIENT_ID")
+    if not client_id or not secret("GOOGLE_CLIENT_SECRET"):
+        return None
+    state = random_secrets.token_urlsafe(32)
+    st.session_state.google_oauth_state = state
+    params = {
+        "client_id": client_id,
+        "redirect_uri": google_redirect_uri(),
+        "response_type": "code",
+        "scope": GOOGLE_SCOPE,
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "prompt": "consent",
+        "state": state,
+    }
+    return f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
 
 
-def _canva_store_tokens(access_token: str, refresh_token: str = "") -> None:
-    _canva_store_init()
-    with sqlite3.connect(_canva_store_path(), timeout=10) as conn:
-        conn.execute("INSERT OR REPLACE INTO oauth_tokens(id, access_token, refresh_token) VALUES (1, ?, ?)", (access_token, refresh_token))
+def google_api_request(method: str, url: str, **kwargs) -> dict:
+    token = st.session_state.get("google_access_token", "")
+    expires_at = float(st.session_state.get("google_token_expires_at", 0) or 0)
+    refresh_token = st.session_state.get("google_refresh_token") or secret("GOOGLE_REFRESH_TOKEN")
+    if expires_at and time.time() >= expires_at - 60 and refresh_token:
+        refreshed = requests.post(GOOGLE_TOKEN_URL, data={
+            "client_id": secret("GOOGLE_CLIENT_ID"),
+            "client_secret": secret("GOOGLE_CLIENT_SECRET"),
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        }, timeout=30)
+        if not refreshed.ok:
+            raise ProviderError("Google session expired. Reconnect Google Business Profile.")
+        data = refreshed.json()
+        token = data["access_token"]
+        st.session_state.google_access_token = token
+        st.session_state.google_token_expires_at = time.time() + int(data.get("expires_in", 3600))
+    if not token:
+        raise ProviderError("Connect Google Business Profile first.")
+    response = requests.request(method, url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}, timeout=30, **kwargs)
+    if not response.ok:
+        try:
+            detail = response.json().get("error", {}).get("message", response.text)
+        except Exception:
+            detail = response.text
+        raise ProviderError(f"Google API error ({response.status_code}): {str(detail)[:500]}")
+    if response.status_code == 204 or not response.text.strip():
+        return {}
+    return response.json()
+
+
+def handle_google_oauth_callback() -> None:
+    code = st.query_params.get("code")
+    returned_state = st.query_params.get("state")
+    if not code or not returned_state or st.session_state.get("google_last_code") == code:
+        return
+    expected_state = st.session_state.get("google_oauth_state")
+    if not expected_state or returned_state != expected_state:
+        # This may be a callback for another provider, such as Canva.
+        return
+    st.session_state.google_last_code = code
+    try:
+        response = requests.post(GOOGLE_TOKEN_URL, data={
+            "code": code,
+            "client_id": secret("GOOGLE_CLIENT_ID"),
+            "client_secret": secret("GOOGLE_CLIENT_SECRET"),
+            "redirect_uri": google_redirect_uri(),
+            "grant_type": "authorization_code",
+        }, timeout=30)
+        if not response.ok:
+            raise ProviderError("Google token exchange failed. Check the OAuth client and redirect URI in Google Cloud.")
+        token_data = response.json()
+        st.session_state.google_access_token = token_data["access_token"]
+        if token_data.get("refresh_token"):
+            st.session_state.google_refresh_token = token_data["refresh_token"]
+        st.session_state.google_token_expires_at = time.time() + int(token_data.get("expires_in", 3600))
+        st.session_state.google_oauth_error = ""
+        st.session_state.google_location_name = ""
+        st.session_state.google_account_name = ""
+        st.session_state.google_location_title = ""
+        st.session_state.google_oauth_success = True
+    except Exception as exc:
+        st.session_state.google_oauth_error = str(exc)
+    finally:
+        # Remove OAuth parameters from the visible URL and avoid reprocessing the code.
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+
+
+def google_get_reviews() -> list[dict]:
+    account_name = st.session_state.get("google_account_name", "")
+    location_name = st.session_state.get("google_location_name", "")
+    if not account_name or not location_name:
+        accounts_data = google_api_request("GET", f"{GOOGLE_ACCOUNT_API}/accounts", params={"pageSize": 20})
+        accounts = accounts_data.get("accounts", [])
+        if not accounts:
+            raise ProviderError("Google sign-in worked, but no Business Profile accounts were returned. Make sure you signed in with an account that manages Malay Tyres.")
+        # Prefer a location/account whose title resembles the business; use first available otherwise.
+        selected_account = accounts[0]
+        for account in accounts:
+            if "malay" in account.get("accountName", "").lower():
+                selected_account = account
+                break
+        account_name = selected_account.get("name", "")
+        if not account_name:
+            raise ProviderError("Google returned an account without a resource name.")
+        locations_data = google_api_request("GET", f"{GOOGLE_INFO_API}/{account_name}/locations", params={"pageSize": 100, "readMask": "name,title,storefrontAddress"})
+        locations = locations_data.get("locations", [])
+        if not locations:
+            raise ProviderError("Google sign-in worked, but no business locations were returned for this account.")
+        selected_location = locations[0]
+        for location in locations:
+            title = location.get("title", "").lower()
+            if "malay" in title or "ujjain" in title:
+                selected_location = location
+                break
+        location_name = selected_location.get("name", "")
+        st.session_state.google_account_name = account_name
+        st.session_state.google_location_name = location_name
+        st.session_state.google_location_title = selected_location.get("title", "Malay Tyres")
+    # Reviews API expects the complete parent resource: accounts/{id}/locations/{id}/reviews.
+    url = f"{GOOGLE_REVIEWS_API}/{location_name}/reviews"
+    all_reviews = []
+    page_token = None
+    for _ in range(10):
+        params = {"pageSize": 50, "orderBy": "updateTime desc"}
+        if page_token:
+            params["pageToken"] = page_token
+        page = google_api_request("GET", url, params=params)
+        all_reviews.extend(page.get("reviews", []))
+        page_token = page.get("nextPageToken")
+        if not page_token:
+            break
+    st.session_state.google_last_sync = now_label()
+    return all_reviews
+
+
+def google_rating_value(value: str) -> int:
+    return {"ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4, "FIVE": 5}.get(str(value).upper(), 5)
+
+
+def sync_google_reviews() -> int:
+    reviews = google_get_reviews()
+    from types import SimpleNamespace
+    synced = {}
+    review_names = {}
+    for item in reviews:
+        reviewer = item.get("reviewer", {}) or {}
+        review_name = item.get("name", "")
+        if not review_name:
+            continue
+        review_id = review_name.split("/")[-1]
+        customer_name = reviewer.get("displayName") or "Customer"
+        rating = google_rating_value(item.get("starRating", "FIVE"))
+        review = SimpleNamespace(
+            review_id=review_id,
+            customer_name=customer_name,
+            rating=rating,
+            text=item.get("comment") or "(Rating-only review)",
+        )
+        prior = st.session_state.get("reviews", {}).get(review_id, {})
+        existing_reply = item.get("reviewReply", {}).get("comment", "")
+        if existing_reply:
+            reply_text = existing_reply
+            status = "Published"
+        elif prior and prior.get("status") in ("Ready to review", "Approved for publishing"):
+            reply_text = prior.get("reply", generate_reply(review))
+            status = prior.get("status", "Ready to review")
+        else:
+            reply_text = generate_reply(review)
+            status = "Ready to review"
+        synced[review_id] = {"review": review, "reply": reply_text, "status": status}
+        review_names[review_id] = review_name
+    st.session_state.reviews = synced
+    st.session_state.google_review_names = review_names
+    st.session_state.connections["Google Business Profile"] = True
+    return len(synced)
+
+
+def publish_google_review_reply(review_id: str, reply: str) -> None:
+    review_name = st.session_state.get("google_review_names", {}).get(review_id)
+    if not review_name:
+        raise ProviderError("This review has no live Google review ID. Sync Google reviews again.")
+    google_api_request("PUT", f"{GOOGLE_REVIEWS_API}/{review_name}/reply", json={"comment": reply})
 
 
 def canva_access_token() -> str:
-    session_token = str(st.session_state.get("canva_access_token") or "")
-    if session_token:
-        return session_token
-    configured_token = secret("CANVA_ACCESS_TOKEN")
-    if configured_token:
-        return configured_token
-    try:
-        _canva_store_init()
-        with sqlite3.connect(_canva_store_path(), timeout=10) as conn:
-            row = conn.execute("SELECT access_token FROM oauth_tokens WHERE id = 1").fetchone()
-            return str(row[0]) if row else ""
-    except Exception:
-        return ""
+    return str(st.session_state.get("canva_access_token") or secret("CANVA_ACCESS_TOKEN"))
+
 
 def gemini_api_key() -> str:
     return secret("GEMINI_API_KEY")
@@ -119,135 +276,40 @@ def canva_redirect_uri() -> str:
     return "http://localhost:8501"
 
 
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
-
-
-def _canva_state_and_verifier(client_secret: str) -> tuple[str, str, str]:
-    """Create a signed, stateless OAuth state and a reproducible PKCE verifier.
-
-    This avoids relying on Streamlit session state or local disk, which may not
-    survive Canva opening a new tab or Streamlit Cloud routing the callback to
-    a different app instance.
-    """
-    nonce = _b64url(py_secrets.token_bytes(32))
-    signature = _b64url(hmac.new(client_secret.encode("utf-8"), ("state:" + nonce).encode("ascii"), hashlib.sha256).digest())
-    state = nonce + "." + signature
-    verifier = _b64url(hmac.new(client_secret.encode("utf-8"), ("verifier:" + nonce).encode("ascii"), hashlib.sha256).digest())
-    challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
-    return state, verifier, challenge
-
-
-def _canva_verifier_from_state(state: str, client_secret: str) -> str:
-    """Validate OAuth state and reproduce its PKCE verifier without server storage."""
-    try:
-        nonce, supplied_signature = state.split(".", 1)
-    except ValueError:
-        return ""
-    expected_signature = _b64url(hmac.new(client_secret.encode("utf-8"), ("state:" + nonce).encode("ascii"), hashlib.sha256).digest())
-    if not hmac.compare_digest(supplied_signature, expected_signature):
-        return ""
-    return _b64url(hmac.new(client_secret.encode("utf-8"), ("verifier:" + nonce).encode("ascii"), hashlib.sha256).digest())
-
-
 def handle_canva_oauth_callback() -> None:
-    """Exchange Canva's callback code using the verifier created for that exact request."""
     code = st.query_params.get("code")
     returned_state = st.query_params.get("state")
-    oauth_error = st.query_params.get("error")
-    if oauth_error:
-        st.session_state.canva_oauth_error = f"Canva authorization was not completed ({oauth_error}). Start again from Connections."
-        st.query_params.clear()
+    if not code or not returned_state or not st.session_state.get("canva_oauth_state") or st.session_state.get("canva_last_code") == code:
         return
-    if not code or not returned_state:
+    st.session_state.canva_last_code = code
+    expected_state = st.session_state.get("canva_oauth_state")
+    verifier = st.session_state.get("canva_code_verifier")
+    if not expected_state or returned_state != expected_state or not verifier:
+        st.session_state.canva_oauth_error = "Canva OAuth state validation failed. Start the connection again."
         return
-    if st.session_state.get("canva_last_code") == code:
-        return
-
-    # Validate signed state and reproduce the PKCE verifier without relying on
-    # session state, SQLite, /tmp persistence, or a particular Cloud instance.
-    client_id = secret("CANVA_CLIENT_ID")
-    client_secret = secret("CANVA_CLIENT_SECRET")
-    state_secret = secret("CANVA_OAUTH_STATE_SECRET") or client_secret
-    verifier = _canva_verifier_from_state(str(returned_state), state_secret)
-    if not verifier:
-        st.session_state.canva_oauth_error = "Canva OAuth state validation failed. The callback state is invalid or the Canva Client Secret changed during authorization. Return to Connections and click Authorize Canva again."
-        st.query_params.clear()
-        return
-
     try:
-        redirect_uri = canva_redirect_uri()
-        basic = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
-        response = requests.post(
-            "https://api.canva.com/rest/v1/oauth/token",
-            headers={"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"},
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "code_verifier": verifier,
-                "redirect_uri": redirect_uri,
-            },
-            timeout=30,
+        token_response = exchange_code(
+            code,
+            verifier,
+            secret("CANVA_CLIENT_ID"),
+            secret("CANVA_CLIENT_SECRET"),
+            canva_redirect_uri(),
         )
-        if not response.ok:
-            # Do not display request headers, client secret, or token contents.
-            detail = "Canva rejected the token exchange. Verify the current Client ID/secret and that the redirect URI matches exactly in Canva and Streamlit."
-            try:
-                api_error = response.json().get("error")
-                if api_error:
-                    detail += f" Error: {api_error}."
-            except Exception:
-                pass
-            raise RuntimeError(detail)
-        token_response = response.json()
-        access_token = token_response.get("access_token")
-        if not access_token:
-            raise RuntimeError("Canva did not return an access token. Check the OAuth app settings and scopes.")
-        refresh_token = str(token_response.get("refresh_token", ""))
-        st.session_state.canva_access_token = str(access_token)
-        st.session_state.canva_refresh_token = refresh_token
-        _canva_store_tokens(str(access_token), refresh_token)
-        st.session_state.canva_last_code = code
+        st.session_state.canva_access_token = str(token_response["access_token"])
+        st.session_state.canva_refresh_token = str(token_response.get("refresh_token", ""))
         st.session_state.canva_oauth_error = ""
-        st.session_state.canva_oauth_state = ""
-        st.session_state.canva_code_verifier = ""
-        st.query_params.clear()
-    except Exception as exc:
-        message = str(exc)
-        st.session_state.canva_oauth_error = message if message.startswith("Canva ") else "Canva token exchange failed. Verify the Client ID, Client secret, redirect URI, and app scopes in Canva Developer Portal."
-        st.query_params.clear()
-
-
-def secrets_compare(left: str, right: str) -> bool:
-    """Constant-time comparison for OAuth state values."""
-    import hmac
-    return hmac.compare_digest(str(left), str(right))
+    except Exception:
+        st.session_state.canva_oauth_error = "Canva OAuth token exchange failed. Check the Client ID, Client secret and redirect URL."
 
 
 def canva_authorization_url() -> str | None:
     client_id = secret("CANVA_CLIENT_ID")
     if not client_id or not secret("CANVA_CLIENT_SECRET"):
         return None
-    # Stateless signed state: safe across new tabs and Streamlit Cloud instances.
-    # The same stable key must be used in authorization and callback.
-    state_secret = secret("CANVA_OAUTH_STATE_SECRET") or secret("CANVA_CLIENT_SECRET")
-    state, verifier, challenge = _canva_state_and_verifier(state_secret)
-    st.session_state.canva_oauth_state = state
-    st.session_state.canva_code_challenge = challenge
-    scopes = secret(
-        "CANVA_SCOPES",
-        "brandtemplate:content:read brandtemplate:content:write brandtemplate:meta:read design:content:read design:content:write design:meta:read asset:read asset:write profile:read",
-    )
-    params = {
-        "code_challenge_method": "s256",
-        "response_type": "code",
-        "client_id": client_id,
-        "redirect_uri": canva_redirect_uri(),
-        "scope": scopes,
-        "state": state,
-        "code_challenge": challenge,
-    }
-    return "https://www.canva.com/api/oauth/authorize?" + urlencode(params)
+    request = create_pkce_request(client_id, canva_redirect_uri())
+    st.session_state.canva_oauth_state = request.state
+    st.session_state.canva_code_verifier = request.code_verifier
+    return request.authorization_url
 
 
 def canva_ready() -> bool:
@@ -343,7 +405,7 @@ def publish_live(draft: ContentDraft, design: dict) -> tuple[dict, ...]:
                 ).send_image(image_url, draft.body)
             )
         elif destination == Destination.GOOGLE_BUSINESS_PROFILE:
-            receipts.append({"provider": "google_business_profile", "status": "demo_only"})
+            raise ProviderError("Google Business Profile content-post publishing is not enabled in this connector yet. Review replies are supported after Google is connected.")
     return tuple(receipts)
 
 
@@ -365,6 +427,8 @@ def initialize_state() -> None:
     st.session_state.setdefault("canva_refresh_token", "")
     st.session_state.setdefault("canva_oauth_error", "")
     st.session_state.setdefault("canva_last_code", "")
+    st.session_state.setdefault("google_review_names", {})
+    st.session_state.setdefault("google_oauth_error", "")
     st.session_state.setdefault("publisher", InMemoryPublisher())
     st.session_state.setdefault("publishing_log", [])
     st.session_state.setdefault("activity_log", [
@@ -396,7 +460,7 @@ def render_header() -> None:
 
     with st.container(horizontal=True, vertical_alignment="center"):
         st.markdown("**AUTOMATION STATUS**")
-        badge("Demo mode", "blue")
+        badge("Live Google connected" if google_connected() else "Google not connected", "green" if google_connected() else "blue")
         badge("Approval gate on", "green")
         st.caption(f"Last review check · {st.session_state.review_run_at}")
 
@@ -498,22 +562,39 @@ def render_review_card(review_id: str, item: dict) -> None:
                 item["reply"] = edited_reply
                 item["status"] = "Approved for publishing"
                 add_activity("Review agent", f"Saved a reply for {review.customer_name}")
-                st.success("Reply saved. The real connector can publish it after GBP is connected.")
-            if st.button("Mark as published", key=f"publish_review_{review_id}", disabled=item["status"] != "Approved for publishing", icon=":material/send:"):
-                item["status"] = "Published"
-                add_activity("Publishing agent", f"Demo-published the reply for {review.customer_name} to GBP")
-                st.success("Demo receipt created. No external API call was made.")
+                st.success("Reply approved and saved. It will not be sent until you click Publish approved reply to Google.")
+            if st.button("Publish approved reply to Google", key=f"publish_review_{review_id}", disabled=item["status"] != "Approved for publishing" or not google_connected(), icon=":material/send:"):
+                try:
+                    publish_google_review_reply(review_id, edited_reply.strip())
+                    item["reply"] = edited_reply.strip()
+                    item["status"] = "Published"
+                    add_activity("Publishing agent", f"Published an approved reply for {review.customer_name} to Google Business Profile")
+                    st.success("Approved reply published to Google Business Profile.")
+                except Exception as exc:
+                    st.error(f"Google reply failed: {exc}")
 
 
 def render_reviews() -> None:
     st.header("Google Business Profile review inbox")
-    st.write("Every review gets its own rating-aware response. Edit it, approve it, and only then publish.")
-    st.info("Real GBP access requires OAuth credentials and the Google Business Profile APIs. This workspace currently uses sample reviews and a safe in-memory publisher.", icon=":material/info:")
-    if st.button("Refresh all suggested replies", type="primary", icon=":material/auto_awesome:"):
+    st.write("Real Google reviews are loaded here. Replies remain drafts until you save and explicitly publish each one.")
+    if google_connected():
+        st.success(f"Google Business Profile connected · {st.session_state.get('google_location_title', 'Business location')}")
+        if st.button("Sync real Google reviews", type="primary", icon=":material/refresh:"):
+            try:
+                count = sync_google_reviews()
+                add_activity("Google Business Profile", f"Synced {count} real reviews from Google")
+                st.success(f"Synced {count} reviews from Google.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Review sync failed: {exc}")
+    else:
+        st.warning("Google is not connected yet. Open Connections and click Connect Google Business Profile.")
+    if st.button("Refresh suggested replies", icon=":material/auto_awesome:"):
         for item in st.session_state.reviews.values():
-            item["reply"] = generate_reply(item["review"])
-            item["status"] = "Ready to review"
-        add_activity("Review agent", "Generated a different polite reply for each review")
+            if item.get("status") != "Published":
+                item["reply"] = generate_reply(item["review"])
+                item["status"] = "Ready to review"
+        add_activity("Review agent", "Refreshed suggested replies without publishing")
         st.rerun()
     for review_id, item in st.session_state.reviews.items():
         render_review_card(review_id, item)
@@ -682,6 +763,7 @@ def render_connections() -> None:
     for name, description in descriptions.items():
         with st.container(border=True):
             key_ready = {
+                "Google Business Profile": google_connected(),
                 "Gemini": bool(gemini_api_key()),
                 "Canva": canva_ready(),
                 "Instagram": instagram_ready(),
@@ -695,21 +777,46 @@ def render_connections() -> None:
                 badge("Configured" if key_ready else "Needs secrets", "green" if key_ready else "orange")
     st.space("small")
     with st.container(border=True):
+        st.subheader("Connect Google Business Profile")
+        st.write("Authorize the Google account that manages the Malay Tyres Business Profile. The app will read reviews and publish replies only after you approve each reply.")
+        if google_connected():
+            st.success(f"Connected to Google · {st.session_state.get('google_location_title') or 'Business Profile'}")
+            if st.button("Sync Google reviews now", type="primary", key="google_sync_connections"):
+                try:
+                    count = sync_google_reviews()
+                    add_activity("Google Business Profile", f"Synced {count} real reviews from Google")
+                    st.success(f"Successfully loaded {count} Google reviews. Open Reviews to approve replies.")
+                except Exception as exc:
+                    st.error(f"Google connection is authorized, but review sync failed: {exc}")
+            if st.button("Disconnect Google for this session", key="google_disconnect"):
+                for key in ("google_access_token", "google_refresh_token", "google_token_expires_at", "google_account_name", "google_location_name", "google_location_title", "google_oauth_state"):
+                    st.session_state.pop(key, None)
+                st.rerun()
+        elif secret("GOOGLE_CLIENT_ID") and secret("GOOGLE_CLIENT_SECRET"):
+            auth_url = google_authorization_url()
+            if auth_url:
+                st.link_button("Connect Google Business Profile", auth_url, icon=":material/login:", width="stretch")
+                st.caption(f"Google OAuth redirect URI must exactly match: {google_redirect_uri()}")
+        else:
+            st.warning("Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in Streamlit Cloud → Settings → Secrets. Never paste the values into chat.")
+        if st.session_state.get("google_oauth_error"):
+            st.error(st.session_state.google_oauth_error)
+        if st.session_state.get("google_oauth_success"):
+            st.success("Google sign-in succeeded. Click Sync Google reviews now to load your live reviews.")
+            st.session_state.google_oauth_success = False
+    st.space("small")
+    with st.container(border=True):
         st.subheader("Connect Canva with OAuth")
         st.caption("Use your Canva Client ID and Client secret here through Streamlit secrets. The secret stays on the server; only the Canva authorization page opens in your browser.")
-        if canva_access_token() and secret("CANVA_BRAND_TEMPLATE_ID"):
-            st.success("Canva is configured: access token and Brand Template ID are available.", icon=":material/check_circle:")
+        if canva_access_token():
+            st.success("Canva access token is available for this session.", icon=":material/check_circle:")
         elif secret("CANVA_CLIENT_ID") and secret("CANVA_CLIENT_SECRET"):
-            if canva_access_token() and not secret("CANVA_BRAND_TEMPLATE_ID"):
-                st.warning("A Canva access token exists, but CANVA_BRAND_TEMPLATE_ID is missing.")
-            elif not canva_access_token():
-                st.info("Canva credentials are present. Click Authorize Canva to obtain an access token for this session.")
             authorization_url = canva_authorization_url()
             if authorization_url:
                 st.link_button("Authorize Canva", authorization_url, icon=":material/login:", width="stretch")
                 st.caption(f"Canva must redirect back to: {canva_redirect_uri()}")
         else:
-            st.info("Add CANVA_CLIENT_ID and CANVA_CLIENT_SECRET to Streamlit secrets. Also set CANVA_REDIRECT_URI and CANVA_BRAND_TEMPLATE_ID.", icon=":material/key:")
+            st.info("Add CANVA_CLIENT_ID, CANVA_CLIENT_SECRET and CANVA_REDIRECT_URI to Streamlit secrets, then this button will appear.", icon=":material/key:")
         if st.session_state.canva_oauth_error:
             st.error(st.session_state.canva_oauth_error, icon=":material/error:")
     st.space("small")
@@ -723,6 +830,7 @@ def render_connections() -> None:
 
 
 initialize_state()
+handle_google_oauth_callback()
 handle_canva_oauth_callback()
 view = render_sidebar()
 render_header()
