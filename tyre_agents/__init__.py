@@ -11,6 +11,7 @@ from .core import (
     publish_approved,
 )
 from .canva_oauth import PkceRequest, create_pkce_request, exchange_code
+from .gemini_text import CampaignResult, GeminiTextGenerator
 from .providers import CanvaAdapter, InstagramAdapter, ProviderError, WhatsAppAdapter
 
 __all__ = [
@@ -25,6 +26,8 @@ __all__ = [
     "PkceRequest",
     "create_pkce_request",
     "exchange_code",
+    "CampaignResult",
+    "GeminiTextGenerator",
     "CanvaAdapter",
     "InstagramAdapter",
     "WhatsAppAdapter",

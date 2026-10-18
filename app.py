@@ -18,6 +18,7 @@ from tyre_agents.core import (
 )
 from tyre_agents.canva_oauth import create_pkce_request, exchange_code
 from tyre_agents.providers import CanvaAdapter, InstagramAdapter, ProviderError, WhatsAppAdapter
+from tyre_agents.gemini_text import GeminiTextGenerator
 
 
 st.set_page_config(page_title="Malay Tyres command centre", page_icon=":material/tire_repair:", layout="wide")
@@ -50,6 +51,10 @@ def secret(name: str, default: str = "") -> str:
 
 def canva_access_token() -> str:
     return str(st.session_state.get("canva_access_token") or secret("CANVA_ACCESS_TOKEN"))
+
+
+def gemini_api_key() -> str:
+    return secret("GEMINI_API_KEY")
 
 
 def canva_redirect_uri() -> str:
@@ -127,6 +132,27 @@ def generate_canva_design(draft: ContentDraft) -> dict:
         },
         title=draft.title,
     )
+
+
+def generate_campaign_draft(topic: str, tone: str, draft_id: str, destinations: tuple[Destination, ...]) -> tuple[ContentDraft, str]:
+    """Prefer Gemini for copy, with a deterministic fallback for offline trials."""
+    if gemini_api_key():
+        campaign = GeminiTextGenerator(gemini_api_key()).generate(f"{topic.strip()} (tone: {tone})")
+        return ContentDraft(
+            draft_id=draft_id,
+            title=campaign.title,
+            body=campaign.body,
+            image_prompt=campaign.image_prompt,
+            destinations=destinations,
+        ), "Gemini"
+    fallback = generate_content(topic, draft_id=draft_id)
+    return ContentDraft(
+        draft_id=fallback.draft_id,
+        title=f"{fallback.title} · {tone}",
+        body=fallback.body,
+        image_prompt=fallback.image_prompt,
+        destinations=destinations,
+    ), "offline fallback"
 
 
 def publish_live(draft: ContentDraft, design: dict) -> tuple[dict, ...]:
@@ -255,8 +281,8 @@ def render_metric_row() -> None:
     cols[0].metric("Reviews to handle", str(pending_reviews), "Daily check")
     cols[1].metric("Content awaiting approval", str(pending_draft), "Human gate")
     cols[2].metric("Published this session", str(published), "Demo receipts")
-    ready = int(canva_ready()) + int(instagram_ready()) + int(whatsapp_ready())
-    cols[3].metric("Connections ready", f"{ready}/3", "Canva + Meta")
+    ready = int(gemini_api_key() != "") + int(canva_ready()) + int(instagram_ready()) + int(whatsapp_ready())
+    cols[3].metric("Connections ready", f"{ready}/4", "Gemini + Canva + Meta")
 
 
 def render_overview() -> None:
@@ -399,19 +425,40 @@ def render_content_studio() -> None:
             submitted = st.form_submit_button("Generate content + Canva design", type="primary", icon=":material/auto_awesome:", width="stretch")
         if submitted:
             draft_id = f"draft-{len(st.session_state.activity_log) + 1}"
-            draft = generate_content(topic, draft_id=draft_id)
-            draft = ContentDraft(
-                draft_id=draft.draft_id,
-                title=f"{draft.title} · {tone}",
-                body=draft.body,
-                image_prompt=draft.image_prompt,
-                destinations=selected_destinations_from_labels(destinations),
-            )
+            try:
+                draft, copy_provider = generate_campaign_draft(
+                    topic,
+                    tone,
+                    draft_id,
+                    selected_destinations_from_labels(destinations),
+                )
+            except ValueError as exc:
+                st.warning(f"Gemini copy generation failed: {exc}. Using the offline fallback.", icon=":material/warning:")
+                fallback = generate_content(topic, draft_id=draft_id)
+                draft = ContentDraft(
+                    draft_id=fallback.draft_id,
+                    title=f"{fallback.title} · {tone}",
+                    body=fallback.body,
+                    image_prompt=fallback.image_prompt,
+                    destinations=selected_destinations_from_labels(destinations),
+                )
+                copy_provider = "offline fallback"
+            except Exception:
+                st.warning("Gemini copy generation was unavailable. Using the offline fallback.", icon=":material/warning:")
+                fallback = generate_content(topic, draft_id=draft_id)
+                draft = ContentDraft(
+                    draft_id=fallback.draft_id,
+                    title=f"{fallback.title} · {tone}",
+                    body=fallback.body,
+                    image_prompt=fallback.image_prompt,
+                    destinations=selected_destinations_from_labels(destinations),
+                )
+                copy_provider = "offline fallback"
             st.session_state.queue.add(draft)
             st.session_state.draft = draft
             st.session_state.generated_design = None
             st.session_state.design_error = None
-            add_activity("Content agent", f"Generated copy and a Canva design brief for {topic}")
+            add_activity("Content agent", f"Generated copy with {copy_provider} and a Canva design brief for {topic}")
             if canva_ready():
                 try:
                     with st.spinner("Creating the branded visual automatically in Canva..."):
@@ -477,6 +524,7 @@ def render_connections() -> None:
     st.warning("Canva's public REST API does not expose Magic Media text-to-image generation. This app uses Canva's supported brand-template autofill/export flow, so your Canva brand template should already contain the visual treatment/background.", icon=":material/info:")
     descriptions = {
         "Google Business Profile": "Read new reviews and publish approved replies through Google OAuth.",
+        "Gemini": "Generate the campaign copy and image prompt. Gemini image generation is not used.",
         "Canva": "Create and export the branded visual from a Canva brand template.",
         "Instagram": "Publish approved feed posts and stories through the Instagram Graph API.",
         "WhatsApp": "Send approved image messages through the WhatsApp Cloud API.",
@@ -484,6 +532,7 @@ def render_connections() -> None:
     for name, description in descriptions.items():
         with st.container(border=True):
             key_ready = {
+                "Gemini": bool(gemini_api_key()),
                 "Canva": canva_ready(),
                 "Instagram": instagram_ready(),
                 "WhatsApp": whatsapp_ready(),
@@ -512,6 +561,7 @@ def render_connections() -> None:
     st.space("small")
     with st.container(border=True):
         st.subheader("Production checklist")
+        st.markdown(":material/check_box_outline_blank: Add GEMINI_API_KEY for AI-written campaign copy")
         st.markdown(":material/check_box_outline_blank: Add Canva access token and brand template ID")
         st.markdown(":material/check_box_outline_blank: Add Instagram Graph API token and business account ID")
         st.markdown(":material/check_box_outline_blank: Add WhatsApp Cloud API token, phone ID and recipient number")

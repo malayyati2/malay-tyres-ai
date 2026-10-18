@@ -3,7 +3,7 @@
 A Streamlit MVP for a human-approved multi-agent workflow for Malay Tyres:
 
 - **Review agent**: prepares a distinct, polite reply for each Google Business Profile review.
-- **Content agent**: creates campaign copy and automatically creates a branded visual in Canva from a configured brand template.
+- **Content agent**: uses Gemini for campaign copy and automatically creates a branded visual in Canva from a configured brand template.
 - **Publishing agent**: routes approved assets only to the destinations selected by the operator: Google Business Profile, Instagram feed, Instagram story or WhatsApp.
 - **Safety gate**: no content can be published until the operator approves it.
 
@@ -19,11 +19,13 @@ uv sync --all-extras
 
 This creates a project-local environment from the pinned `uv.lock`. Keep real credentials out of the repository. For a future connector, use Streamlit secrets or environment variables based on `.env.example`.
 
-### Configure Canva, Instagram and WhatsApp
+### Configure Gemini, Canva, Instagram and WhatsApp
 
 Create `.streamlit/secrets.toml` locally (it is ignored by Git) and add the following keys:
 
 ```toml
+GEMINI_API_KEY = "your-google-ai-studio-api-key"
+
 CANVA_CLIENT_ID = "your-canva-client-id"
 CANVA_CLIENT_SECRET = "your-canva-client-secret"
 CANVA_REDIRECT_URI = "https://your-app-name.streamlit.app"
@@ -44,6 +46,8 @@ META_GRAPH_API_VERSION = "v21.0"
 ```
 
 The Canva template must be a published Brand Template with autofill fields matching the configured field names. Canva's public REST APIs support brand-template autofill and PNG export, but do not expose Canva Magic Media text-to-image generation as a REST endpoint. This app therefore creates the design automatically from your branded Canva template; no manual Canva editing step is required during each campaign.
+
+Gemini is used for text copy and the image prompt only. The app does not call Gemini image generation. Create a Gemini API key at https://aistudio.google.com/app/apikey and add it as `GEMINI_API_KEY`. If it is absent or unavailable, the app uses a deterministic offline fallback so the Canva trial can still be tested.
 
 The Connections page now includes a **Authorize Canva** button when `CANVA_CLIENT_ID`, `CANVA_CLIENT_SECRET` and `CANVA_REDIRECT_URI` are configured. Add the exact same redirect URI in the Canva Developer Portal. After authorization, the app exchanges the OAuth code server-side using PKCE. For a persistent deployed connection, store the resulting access/refresh tokens in a proper encrypted database; Streamlit session state is suitable for this trial only.
 
