@@ -3,6 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from urllib.parse import urlencode
 import secrets as random_secrets
+import base64
+import hashlib
+import hmac
+import sqlite3
 import time
 import os
 
@@ -54,6 +58,49 @@ def secret(name: str, default: str = "") -> str:
         return default
 
 
+# OAuth state is signed so callbacks work even if Streamlit opens a fresh browser session.
+OAUTH_DB_PATH = "/tmp/malay_tyres_oauth.sqlite3"
+
+def oauth_db_init() -> None:
+    with sqlite3.connect(OAUTH_DB_PATH, timeout=10) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS oauth_tokens (provider TEXT PRIMARY KEY, access_token TEXT NOT NULL, refresh_token TEXT NOT NULL DEFAULT '', expires_at REAL NOT NULL DEFAULT 0)")
+
+def oauth_token_save(provider: str, access_token: str, refresh_token: str = "", expires_at: float = 0) -> None:
+    oauth_db_init()
+    with sqlite3.connect(OAUTH_DB_PATH, timeout=10) as conn:
+        conn.execute("INSERT OR REPLACE INTO oauth_tokens(provider, access_token, refresh_token, expires_at) VALUES (?, ?, ?, ?)", (provider, access_token, refresh_token, float(expires_at or 0)))
+
+def oauth_token_get(provider: str) -> tuple[str, str, float]:
+    try:
+        oauth_db_init()
+        with sqlite3.connect(OAUTH_DB_PATH, timeout=10) as conn:
+            row = conn.execute("SELECT access_token, refresh_token, expires_at FROM oauth_tokens WHERE provider = ?", (provider,)).fetchone()
+        return (str(row[0]), str(row[1]), float(row[2])) if row else ("", "", 0.0)
+    except Exception:
+        return "", "", 0.0
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+def _signed_state(provider: str, signing_secret: str) -> str:
+    nonce = _b64url(random_secrets.token_bytes(32))
+    signature = _b64url(hmac.new(signing_secret.encode("utf-8"), (provider + ":" + nonce).encode("ascii"), hashlib.sha256).digest())
+    return nonce + "." + signature
+
+def _valid_signed_state(provider: str, state: str, signing_secret: str) -> bool:
+    try:
+        nonce, supplied = state.split(".", 1)
+    except ValueError:
+        return False
+    expected = _b64url(hmac.new(signing_secret.encode("utf-8"), (provider + ":" + nonce).encode("ascii"), hashlib.sha256).digest())
+    return hmac.compare_digest(supplied, expected)
+
+def _canva_verifier_from_state(state: str, signing_secret: str) -> str:
+    if not _valid_signed_state("canva", state, signing_secret):
+        return ""
+    nonce = state.split(".", 1)[0]
+    return _b64url(hmac.new(signing_secret.encode("utf-8"), ("canva-verifier:" + nonce).encode("ascii"), hashlib.sha256).digest())
+
 # Google Business Profile API configuration. Tokens remain in this Streamlit session.
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -71,15 +118,17 @@ def google_redirect_uri() -> str:
 
 
 def google_connected() -> bool:
-    return bool(st.session_state.get("google_access_token"))
+    return bool(st.session_state.get("google_access_token") or oauth_token_get("google")[0])
 
+def google_state_secret() -> str:
+    return secret("GOOGLE_OAUTH_STATE_SECRET") or secret("GOOGLE_CLIENT_SECRET")
 
 def google_authorization_url() -> str | None:
     client_id = secret("GOOGLE_CLIENT_ID")
-    if not client_id or not secret("GOOGLE_CLIENT_SECRET"):
+    client_secret = secret("GOOGLE_CLIENT_SECRET")
+    if not client_id or not client_secret:
         return None
-    state = random_secrets.token_urlsafe(32)
-    st.session_state.google_oauth_state = state
+    state = _signed_state("google", google_state_secret())
     params = {
         "client_id": client_id,
         "redirect_uri": google_redirect_uri(),
@@ -94,9 +143,10 @@ def google_authorization_url() -> str | None:
 
 
 def google_api_request(method: str, url: str, **kwargs) -> dict:
-    token = st.session_state.get("google_access_token", "")
-    expires_at = float(st.session_state.get("google_token_expires_at", 0) or 0)
-    refresh_token = st.session_state.get("google_refresh_token") or secret("GOOGLE_REFRESH_TOKEN")
+    stored_access, stored_refresh, stored_expiry = oauth_token_get("google")
+    token = st.session_state.get("google_access_token") or stored_access
+    expires_at = float(st.session_state.get("google_token_expires_at", 0) or stored_expiry or 0)
+    refresh_token = st.session_state.get("google_refresh_token") or stored_refresh or secret("GOOGLE_REFRESH_TOKEN")
     if expires_at and time.time() >= expires_at - 60 and refresh_token:
         refreshed = requests.post(GOOGLE_TOKEN_URL, data={
             "client_id": secret("GOOGLE_CLIENT_ID"),
@@ -108,8 +158,10 @@ def google_api_request(method: str, url: str, **kwargs) -> dict:
             raise ProviderError("Google session expired. Reconnect Google Business Profile.")
         data = refreshed.json()
         token = data["access_token"]
+        expires_at = time.time() + int(data.get("expires_in", 3600))
         st.session_state.google_access_token = token
-        st.session_state.google_token_expires_at = time.time() + int(data.get("expires_in", 3600))
+        st.session_state.google_token_expires_at = expires_at
+        oauth_token_save("google", token, refresh_token, expires_at)
     if not token:
         raise ProviderError("Connect Google Business Profile first.")
     response = requests.request(method, url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}, timeout=30, **kwargs)
@@ -127,13 +179,21 @@ def google_api_request(method: str, url: str, **kwargs) -> dict:
 def handle_google_oauth_callback() -> None:
     code = st.query_params.get("code")
     returned_state = st.query_params.get("state")
-    if not code or not returned_state or st.session_state.get("google_last_code") == code:
+    oauth_error = st.query_params.get("error")
+    if not returned_state:
         return
-    expected_state = st.session_state.get("google_oauth_state")
-    if not expected_state or returned_state != expected_state:
-        # This may be a callback for another provider, such as Canva.
+    state_secret = google_state_secret()
+    if not _valid_signed_state("google", str(returned_state), state_secret):
+        # A callback for Canva or another provider belongs to its own handler.
         return
-    st.session_state.google_last_code = code
+    if oauth_error:
+        st.session_state.google_oauth_error = f"Google authorization was not completed ({oauth_error}). Start again from Connections."
+        st.query_params.clear()
+        return
+    if not code:
+        st.session_state.google_oauth_error = "Google returned without an authorization code. Start again from Connections."
+        st.query_params.clear()
+        return
     try:
         response = requests.post(GOOGLE_TOKEN_URL, data={
             "code": code,
@@ -143,12 +203,22 @@ def handle_google_oauth_callback() -> None:
             "grant_type": "authorization_code",
         }, timeout=30)
         if not response.ok:
-            raise ProviderError("Google token exchange failed. Check the OAuth client and redirect URI in Google Cloud.")
+            try:
+                data = response.json()
+                detail = data.get("error_description") or data.get("error") or "Google rejected the token exchange."
+            except Exception:
+                detail = "Google rejected the token exchange. Check the OAuth client and redirect URI in Google Cloud."
+            raise ProviderError(f"Google token exchange failed: {str(detail)[:300]}")
         token_data = response.json()
-        st.session_state.google_access_token = token_data["access_token"]
-        if token_data.get("refresh_token"):
-            st.session_state.google_refresh_token = token_data["refresh_token"]
-        st.session_state.google_token_expires_at = time.time() + int(token_data.get("expires_in", 3600))
+        access_token = str(token_data.get("access_token", ""))
+        if not access_token:
+            raise ProviderError("Google did not return an access token. Check the OAuth client configuration.")
+        refresh_token = str(token_data.get("refresh_token") or oauth_token_get("google")[1] or "")
+        expires_at = time.time() + int(token_data.get("expires_in", 3600))
+        st.session_state.google_access_token = access_token
+        st.session_state.google_refresh_token = refresh_token
+        st.session_state.google_token_expires_at = expires_at
+        oauth_token_save("google", access_token, refresh_token, expires_at)
         st.session_state.google_oauth_error = ""
         st.session_state.google_location_name = ""
         st.session_state.google_account_name = ""
@@ -157,7 +227,6 @@ def handle_google_oauth_callback() -> None:
     except Exception as exc:
         st.session_state.google_oauth_error = str(exc)
     finally:
-        # Remove OAuth parameters from the visible URL and avoid reprocessing the code.
         try:
             st.query_params.clear()
         except Exception:
@@ -262,7 +331,7 @@ def publish_google_review_reply(review_id: str, reply: str) -> None:
 
 
 def canva_access_token() -> str:
-    return str(st.session_state.get("canva_access_token") or secret("CANVA_ACCESS_TOKEN"))
+    return str(st.session_state.get("canva_access_token") or oauth_token_get("canva")[0] or secret("CANVA_ACCESS_TOKEN"))
 
 
 def gemini_api_key() -> str:
@@ -276,40 +345,76 @@ def canva_redirect_uri() -> str:
     return "http://localhost:8501"
 
 
+def canva_state_secret() -> str:
+    return secret("CANVA_OAUTH_STATE_SECRET") or secret("CANVA_CLIENT_SECRET")
+
 def handle_canva_oauth_callback() -> None:
     code = st.query_params.get("code")
     returned_state = st.query_params.get("state")
-    if not code or not returned_state or not st.session_state.get("canva_oauth_state") or st.session_state.get("canva_last_code") == code:
+    oauth_error = st.query_params.get("error")
+    if not returned_state:
         return
-    st.session_state.canva_last_code = code
-    expected_state = st.session_state.get("canva_oauth_state")
-    verifier = st.session_state.get("canva_code_verifier")
-    if not expected_state or returned_state != expected_state or not verifier:
-        st.session_state.canva_oauth_error = "Canva OAuth state validation failed. Start the connection again."
+    state_secret = canva_state_secret()
+    verifier = _canva_verifier_from_state(str(returned_state), state_secret)
+    if not verifier:
+        # Not this provider's callback, so let the Google handler process its own state.
+        return
+    if oauth_error:
+        st.session_state.canva_oauth_error = f"Canva authorization was not completed ({oauth_error}). Start again from Connections."
+        st.query_params.clear()
+        return
+    if not code:
+        st.session_state.canva_oauth_error = "Canva returned without an authorization code. Start again from Connections."
+        st.query_params.clear()
         return
     try:
-        token_response = exchange_code(
-            code,
-            verifier,
-            secret("CANVA_CLIENT_ID"),
-            secret("CANVA_CLIENT_SECRET"),
-            canva_redirect_uri(),
+        client_id = secret("CANVA_CLIENT_ID")
+        client_secret = secret("CANVA_CLIENT_SECRET")
+        redirect_uri = canva_redirect_uri()
+        basic = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+        response = requests.post(
+            "https://api.canva.com/rest/v1/oauth/token",
+            headers={"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"},
+            data={"grant_type": "authorization_code", "code": code, "code_verifier": verifier, "redirect_uri": redirect_uri},
+            timeout=30,
         )
-        st.session_state.canva_access_token = str(token_response["access_token"])
-        st.session_state.canva_refresh_token = str(token_response.get("refresh_token", ""))
+        if not response.ok:
+            try:
+                detail = response.json().get("error") or "Canva rejected the token exchange."
+            except Exception:
+                detail = "Canva rejected the token exchange. Check the OAuth client and redirect URI."
+            raise ProviderError(f"Canva token exchange failed: {str(detail)[:250]}")
+        token_data = response.json()
+        access_token = str(token_data.get("access_token", ""))
+        if not access_token:
+            raise ProviderError("Canva did not return an access token. Check Canva app settings and scopes.")
+        refresh_token = str(token_data.get("refresh_token", ""))
+        expires_at = time.time() + int(token_data.get("expires_in", 3600))
+        st.session_state.canva_access_token = access_token
+        st.session_state.canva_refresh_token = refresh_token
+        oauth_token_save("canva", access_token, refresh_token, expires_at)
         st.session_state.canva_oauth_error = ""
-    except Exception:
-        st.session_state.canva_oauth_error = "Canva OAuth token exchange failed. Check the Client ID, Client secret and redirect URL."
-
+    except Exception as exc:
+        st.session_state.canva_oauth_error = str(exc)
+    finally:
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
 
 def canva_authorization_url() -> str | None:
     client_id = secret("CANVA_CLIENT_ID")
-    if not client_id or not secret("CANVA_CLIENT_SECRET"):
+    client_secret = secret("CANVA_CLIENT_SECRET")
+    if not client_id or not client_secret:
         return None
-    request = create_pkce_request(client_id, canva_redirect_uri())
-    st.session_state.canva_oauth_state = request.state
-    st.session_state.canva_code_verifier = request.code_verifier
-    return request.authorization_url
+    state_secret = canva_state_secret()
+    state = _signed_state("canva", state_secret)
+    nonce = state.split(".", 1)[0]
+    verifier = _b64url(hmac.new(state_secret.encode("utf-8"), ("canva-verifier:" + nonce).encode("ascii"), hashlib.sha256).digest())
+    challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
+    scopes = secret("CANVA_SCOPES", "brandtemplate:content:read brandtemplate:content:write brandtemplate:meta:read design:content:read design:content:write design:meta:read asset:read asset:write profile:read")
+    params = {"code_challenge_method": "s256", "response_type": "code", "client_id": client_id, "redirect_uri": canva_redirect_uri(), "scope": scopes, "state": state, "code_challenge": challenge}
+    return "https://www.canva.com/api/oauth/authorize?" + urlencode(params)
 
 
 def canva_ready() -> bool:
@@ -791,6 +896,8 @@ def render_connections() -> None:
             if st.button("Disconnect Google for this session", key="google_disconnect"):
                 for key in ("google_access_token", "google_refresh_token", "google_token_expires_at", "google_account_name", "google_location_name", "google_location_title", "google_oauth_state"):
                     st.session_state.pop(key, None)
+                with sqlite3.connect(OAUTH_DB_PATH, timeout=10) as conn:
+                    conn.execute("DELETE FROM oauth_tokens WHERE provider = ?", ("google",))
                 st.rerun()
         elif secret("GOOGLE_CLIENT_ID") and secret("GOOGLE_CLIENT_SECRET"):
             auth_url = google_authorization_url()
