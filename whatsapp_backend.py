@@ -19,6 +19,32 @@ def health():
     }), 200
 
 
+@app.get("/oauth/callback")
+def oauth_callback():
+    # Meta may redirect here with an authorization code.
+    # Do not expose or log the code or any access token.
+    error = request.args.get("error")
+    if error:
+        return jsonify({
+            "status": "authorization_not_completed",
+            "message": "Return to the Malay Tyres agent and try again."
+        }), 400
+
+    code = request.args.get("code")
+    if not code:
+        return jsonify({
+            "status": "callback_ready",
+            "message": "OAuth callback endpoint is reachable."
+        }), 200
+
+    # Secure server-side code exchange must be implemented
+    # before this callback can complete Embedded Signup.
+    return jsonify({
+        "status": "callback_received",
+        "message": "Authorization callback received; code exchange is not configured yet."
+    }), 200
+
+
 @app.get("/webhook")
 def verify_webhook():
     mode = request.args.get("hub.mode", "")
@@ -57,8 +83,6 @@ def receive_webhook():
     except Exception:
         return jsonify({"error": "Invalid JSON"}), 400
 
-    # Acknowledge valid events without logging message content
-    # or exposing customer phone numbers.
     if payload.get("object") == "whatsapp_business_account":
         for entry in payload.get("entry", []):
             for change in entry.get("changes", []):
