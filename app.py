@@ -599,15 +599,35 @@ def generate_canva_design(draft: ContentDraft) -> dict:
     )
 
 
+def _is_temporary_gemini_error(exc: Exception) -> bool:
+    """Identify transient Gemini overload/rate-limit/server errors worth retrying."""
+    message = f"{type(exc).__name__}: {exc}".upper()
+    return any(marker in message for marker in (
+        "503", "UNAVAILABLE", "HIGH DEMAND", "429", "RESOURCE_EXHAUSTED",
+        "500", "502", "504", "INTERNAL SERVER ERROR", "BAD GATEWAY", "GATEWAY TIMEOUT",
+    ))
+
+
 def generate_campaign_draft(topic: str, tone: str, draft_id: str, destinations: tuple[Destination, ...]) -> tuple[ContentDraft, str]:
-    """Prefer Gemini for copy, with a deterministic fallback for offline trials."""
+    """Prefer Gemini, retry temporary service failures, then use the offline fallback."""
     if gemini_api_key():
         # GeminiTextGenerator reads GEMINI_MODEL from the environment in supported versions.
         # Override the retired default, but respect a different valid model chosen in Streamlit secrets.
         os.environ["GEMINI_MODEL"] = gemini_model()
-        campaign = GeminiTextGenerator(gemini_api_key(), model=gemini_model()).generate(
-            f"{topic.strip()} (tone: {tone})"
-        )
+        generator = GeminiTextGenerator(gemini_api_key(), model=gemini_model())
+        last_error = None
+        for attempt, wait_seconds in enumerate((0, 2, 5), start=1):
+            if wait_seconds:
+                time.sleep(wait_seconds)
+            try:
+                campaign = generator.generate(f"{topic.strip()} (tone: {tone})")
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt == 3 or not _is_temporary_gemini_error(exc):
+                    raise
+        else:
+            raise last_error  # Defensive: loop normally returns or raises above.
         return ContentDraft(
             draft_id=draft_id,
             title=campaign.title,
