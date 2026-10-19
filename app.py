@@ -599,35 +599,34 @@ def generate_canva_design(draft: ContentDraft) -> dict:
     )
 
 
-def _is_temporary_gemini_error(exc: Exception) -> bool:
-    """Identify transient Gemini overload/rate-limit/server errors worth retrying."""
-    message = f"{type(exc).__name__}: {exc}".upper()
-    return any(marker in message for marker in (
-        "503", "UNAVAILABLE", "HIGH DEMAND", "429", "RESOURCE_EXHAUSTED",
-        "500", "502", "504", "INTERNAL SERVER ERROR", "BAD GATEWAY", "GATEWAY TIMEOUT",
-    ))
-
-
 def generate_campaign_draft(topic: str, tone: str, draft_id: str, destinations: tuple[Destination, ...]) -> tuple[ContentDraft, str]:
-    """Prefer Gemini, retry temporary service failures, then use the offline fallback."""
+    """Prefer Gemini for copy, with a deterministic fallback for offline trials."""
     if gemini_api_key():
         # GeminiTextGenerator reads GEMINI_MODEL from the environment in supported versions.
         # Override the retired default, but respect a different valid model chosen in Streamlit secrets.
         os.environ["GEMINI_MODEL"] = gemini_model()
         generator = GeminiTextGenerator(gemini_api_key(), model=gemini_model())
+        prompt = f"{topic.strip()} (tone: {tone})"
+        # Gemini can return transient 503/429/5xx errors during demand spikes.
+        # Retry briefly before letting the existing offline fallback handle it.
+        campaign = None
         last_error = None
-        for attempt, wait_seconds in enumerate((0, 2, 5), start=1):
-            if wait_seconds:
-                time.sleep(wait_seconds)
+        for attempt in range(3):
             try:
-                campaign = generator.generate(f"{topic.strip()} (tone: {tone})")
+                campaign = generator.generate(prompt)
                 break
             except Exception as exc:
                 last_error = exc
-                if attempt == 3 or not _is_temporary_gemini_error(exc):
+                message = f"{type(exc).__name__}: {exc}".casefold()
+                temporary = any(marker in message for marker in (
+                    "503", "unavailable", "high demand", "429", "resource_exhausted",
+                    "500", "502", "504", "temporarily", "internal server error",
+                ))
+                if not temporary or attempt == 2:
                     raise
-        else:
-            raise last_error  # Defensive: loop normally returns or raises above.
+                time.sleep(1.5 * (attempt + 1))
+        if campaign is None:
+            raise last_error or RuntimeError("Gemini did not return a campaign")
         return ContentDraft(
             draft_id=draft_id,
             title=campaign.title,
