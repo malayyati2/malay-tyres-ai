@@ -403,11 +403,27 @@ def gemini_api_key() -> str:
 
 
 def gemini_model() -> str:
-    """Use the currently recommended model and transparently replace the retired default."""
+    """Use the configured Gemini model, replacing the retired default."""
     configured = secret("GEMINI_MODEL", "gemini-3.8-flash").strip()
     if not configured or configured == "gemini-2.5-flash":
         return "gemini-3.8-flash"
     return configured
+
+
+def gemini_quota_message(error: Exception) -> str | None:
+    """Return a clear explanation for quota errors, without exposing raw API details."""
+    message = str(error).casefold()
+    if "429" in message or "resource_exhausted" in message or "quota exceeded" in message:
+        if "perday" in message or "per_day" in message or "per day" in message or "retrydelay" in message or "retry in 14h" in message:
+            return (
+                "Gemini's daily free-tier request limit is exhausted. The app has used its offline fallback; "
+                "try again after the quota reset or configure an eligible alternative model."
+            )
+        return (
+            "Gemini's request quota/rate limit has been reached. The app has used its offline fallback; "
+            "wait for the limit to reset before trying again."
+        )
+    return None
 
 
 def generate_review_reply(review) -> str:
@@ -607,8 +623,8 @@ def generate_campaign_draft(topic: str, tone: str, draft_id: str, destinations: 
         os.environ["GEMINI_MODEL"] = gemini_model()
         generator = GeminiTextGenerator(gemini_api_key(), model=gemini_model())
         prompt = f"{topic.strip()} (tone: {tone})"
-        # Gemini can return transient 503/429/5xx errors during demand spikes.
-        # Retry briefly before letting the existing offline fallback handle it.
+        # Retry only transient server-capacity errors. Do not retry 429 quota errors:
+        # repeated requests cannot fix exhausted quota and may consume more requests.
         campaign = None
         last_error = None
         for attempt in range(3):
@@ -618,9 +634,12 @@ def generate_campaign_draft(topic: str, tone: str, draft_id: str, destinations: 
             except Exception as exc:
                 last_error = exc
                 message = f"{type(exc).__name__}: {exc}".casefold()
+                # RESOURCE_EXHAUSTED / 429 is a quota response, not a transient server error.
+                if "429" in message or "resource_exhausted" in message or "quota exceeded" in message:
+                    raise
                 temporary = any(marker in message for marker in (
-                    "503", "unavailable", "high demand", "429", "resource_exhausted",
-                    "500", "502", "504", "temporarily", "internal server error",
+                    "503", "unavailable", "high demand", "500", "502", "504",
+                    "temporarily", "internal server error",
                 ))
                 if not temporary or attempt == 2:
                     raise
@@ -952,14 +971,18 @@ def render_content_studio() -> None:
                 )
                 copy_provider = "offline fallback"
             except Exception as exc:
-                error_message = str(exc) or "No error details returned."
-                api_key = gemini_api_key()
-                if api_key:
-                    error_message = error_message.replace(api_key, "[hidden API key]")
-                st.warning(
-                    f"Gemini failed ({type(exc).__name__}): {error_message}. Using the offline fallback.",
-                    icon=":material/warning:",
-                )
+                quota_message = gemini_quota_message(exc)
+                if quota_message:
+                    st.warning(quota_message, icon=":material/warning:")
+                else:
+                    error_message = str(exc) or "No error details returned."
+                    api_key = gemini_api_key()
+                    if api_key:
+                        error_message = error_message.replace(api_key, "[hidden API key]")
+                    st.warning(
+                        f"Gemini failed ({type(exc).__name__}): {error_message}. Using the offline fallback.",
+                        icon=":material/warning:",
+                    )
                 fallback = generate_content(topic, draft_id=draft_id)
                 draft = ContentDraft(
                     draft_id=fallback.draft_id,
