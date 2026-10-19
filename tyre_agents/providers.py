@@ -34,7 +34,21 @@ def _json(response: Any) -> dict[str, Any]:
 
 def _check(response: Any, operation: str) -> dict[str, Any]:
     if not 200 <= int(response.status_code) < 300:
-        raise ProviderError(f"{operation} failed (HTTP {response.status_code})")
+        # Canva often returns a safe, actionable error code/message in JSON.
+        # Keep it useful without ever including request headers or access tokens.
+        detail = ""
+        try:
+            payload = response.json()
+            error = payload.get("error", {}) if isinstance(payload, dict) else {}
+            if isinstance(error, dict):
+                code = error.get("code")
+                message = error.get("message")
+                detail = ": " + " — ".join(str(x) for x in (code, message) if x)
+            elif isinstance(error, str):
+                detail = ": " + error
+        except Exception:
+            pass
+        raise ProviderError(f"{operation} failed (HTTP {response.status_code}){detail}")
     return _json(response)
 
 
@@ -46,7 +60,7 @@ def _job(payload: Mapping[str, Any], operation: str) -> dict[str, Any]:
 
 
 def _poll_job(session: Any, url: str, headers: Mapping[str, str], operation: str,
-              *, attempts: int = 20, interval_seconds: float = 0.25) -> dict[str, Any]:
+              *, attempts: int = 60, interval_seconds: float = 1.0) -> dict[str, Any]:
     for attempt in range(attempts):
         payload = _check(session.get(url, headers=dict(headers)), operation)
         job = payload.get("job")
@@ -57,8 +71,10 @@ def _poll_job(session: Any, url: str, headers: Mapping[str, str], operation: str
             return job
         if status == "failed":
             error = job.get("error")
-            if isinstance(error, dict) and error.get("code"):
-                raise ProviderError(f"{operation} failed: {error['code']}")
+            if isinstance(error, dict):
+                details = " — ".join(str(error[k]) for k in ("code", "message") if error.get(k))
+                if details:
+                    raise ProviderError(f"{operation} failed: {details}")
             raise ProviderError(f"{operation} failed")
         if status != "in_progress":
             raise ProviderError(f"{operation} returned unknown job status")
@@ -75,8 +91,8 @@ class CanvaAdapter:
     session: Any | None = None
 
     def autofill_export(self, text_fields: Mapping[str, str], *, title: str = "Malay Tyres campaign",
-                        export_format: str = "png", poll_attempts: int = 20,
-                        poll_interval_seconds: float = 0.25) -> dict[str, Any]:
+                        export_format: str = "png", poll_attempts: int = 60,
+                        poll_interval_seconds: float = 1.0) -> dict[str, Any]:
         """Autofill a pre-built Canva brand template and return its export URL.
 
         Canva's public REST API supports template autofill and export. It does
@@ -95,7 +111,8 @@ class CanvaAdapter:
                 f"{root}/autofills",
                 headers={**headers, "Content-Type": "application/json"},
                 json={
-                    "type": "create_from_brand_template",
+                    # Canva's current REST schema infers create_from_brand_template
+                    # from brand_template_id. A legacy `type` key is not required.
                     "brand_template_id": self.brand_template_id,
                     "title": title,
                     "data": field_data,
@@ -108,7 +125,8 @@ class CanvaAdapter:
             s, f"{root}/autofills/{fill_job['id']}", headers, "Canva autofill",
             attempts=poll_attempts, interval_seconds=poll_interval_seconds,
         )
-        design = fill_result.get("result", {}).get("design", {})
+        fill_payload = fill_result.get("result", {})
+        design = fill_payload.get("design", {}) if isinstance(fill_payload, dict) else {}
         design_id = design.get("id") or fill_result.get("design", {}).get("id")
         if not design_id:
             raise ProviderError("Canva autofill did not return a design ID")
@@ -128,10 +146,11 @@ class CanvaAdapter:
         urls = export_result.get("urls") or []
         if not urls or not isinstance(urls[0], str):
             raise ProviderError("Canva export did not return a download URL")
+        design_urls = design.get("urls", {}) if isinstance(design.get("urls", {}), dict) else {}
         return {
             "provider": "canva",
             "design_id": design_id,
-            "design_url": design.get("url"),
+            "design_url": design_urls.get("edit_url") or design.get("url") or design_urls.get("view_url"),
             "autofill_id": fill_job["id"],
             "export_id": export_job["id"],
             "image_url": urls[0],
