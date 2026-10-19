@@ -582,7 +582,7 @@ def canva_authorization_url() -> str | None:
 
 
 def canva_ready() -> bool:
-    return bool(canva_access_token() and secret("CANVA_BRAND_TEMPLATE_ID"))
+    return bool(canva_access_token() and secret("CANVA_BRAND_TEMPLATE_ID", "EAHYWp9V4fg"))
 
 
 def instagram_ready() -> bool:
@@ -603,7 +603,7 @@ def generate_canva_design(draft: ContentDraft) -> dict:
     field_cta = secret("CANVA_CTA_FIELD", "CTA")
     adapter = CanvaAdapter(
         access_token=canva_access_token(),
-        brand_template_id=secret("CANVA_BRAND_TEMPLATE_ID"),
+        brand_template_id=secret("CANVA_BRAND_TEMPLATE_ID", "EAHYWp9V4fg"),
     )
     return adapter.autofill_export(
         {
@@ -929,7 +929,7 @@ def render_generated_design(draft: ContentDraft) -> None:
             st.caption("Canva export URLs expire after 24 hours. Publish approved content during this trial window.")
         elif st.session_state.design_error:
             st.warning(st.session_state.design_error, icon=":material/warning:")
-            st.caption("Add CANVA_ACCESS_TOKEN and CANVA_BRAND_TEMPLATE_ID to Streamlit secrets, then submit the brief again.")
+            st.caption("Add CANVA_ACCESS_TOKEN to Streamlit secrets. The verified Malay Tyres template is used by default; set CANVA_BRAND_TEMPLATE_ID only if you want a different template.")
         else:
             st.info("Canva will generate the branded visual when you submit a brief.", icon=":material/image:")
 
@@ -1007,7 +1007,7 @@ def render_content_studio() -> None:
                     st.session_state.design_error = str(exc)
                     st.warning("The copy was created, but Canva did not return a design.", icon=":material/warning:")
             else:
-                st.session_state.design_error = "Canva is not configured yet. Add CANVA_ACCESS_TOKEN and CANVA_BRAND_TEMPLATE_ID to create the design automatically."
+                st.session_state.design_error = "Canva is not configured yet. Add CANVA_ACCESS_TOKEN to Streamlit secrets to create the design automatically."
                 st.warning("The copy was created. Connect Canva to generate the visual automatically.", icon=":material/warning:")
 
     draft = st.session_state.draft
