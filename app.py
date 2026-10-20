@@ -581,44 +581,64 @@ def whatsapp_ready() -> bool:
     )
 
 
+def openai_image_api_key() -> str:
+    """Separate image-generation credential; independent of Gemini text quota."""
+    return secret("OPENAI_API_KEY")
+
+
 def generate_fresh_campaign_image(prompt: str) -> bytes:
-    """Generate a unique square automotive image with Gemini, for insertion into Canva."""
-    api_key = gemini_api_key()
+    """Generate a fresh automotive image using OpenAI Images API for insertion into Canva."""
+    api_key = openai_image_api_key()
     if not api_key:
-        raise ProviderError("Add GEMINI_API_KEY to enable fresh AI image generation")
-    model = secret("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image").strip() or "gemini-2.5-flash-image"
+        raise ProviderError("Add OPENAI_API_KEY to Streamlit Secrets to enable OpenAI image generation")
+    model = secret("OPENAI_IMAGE_MODEL", "gpt-image-2.5-flare").strip() or "gpt-image-2.5-flare"
+    quality = secret("OPENAI_IMAGE_QUALITY", "low").strip().lower() or "low"
+    # Keep output cost-conscious by default. Use a unique creative variation on every request.
     variation = random_secrets.token_hex(4)
     image_prompt = (
-        "Generate ONE photorealistic square 1:1 premium automotive advertising photograph for an Indian tyre and car-care shop. "
+        "Create ONE photorealistic square 1:1 premium automotive advertising photograph for an Indian tyre and car-care shop. "
         "Show a believable Indian-market car/SUV or a tyre/wheel/workshop scene. Use a new composition, camera angle, subject, "
-        "location and lighting; do not use a fixed stock composition. Premium modern 3D-commercial realism, crisp tyre tread and alloy-wheel detail, "
+        "location and lighting; avoid a generic stock-photo look. Premium modern 3D-commercial realism, crisp tyre tread and alloy-wheel detail, "
         "balanced light background with restrained yellow/charcoal accents. No text, no letters, no logos, no watermark, no fake brand badges. "
         "Keep the centre composition clean and leave safe space for Canva overlay text. Make this result visually distinct from earlier generations.\n"
         f"Campaign-specific creative direction: {prompt}\nVariation key: {variation}"
     )
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    endpoint = "https://api.openai.com/v1/images/generations"
     try:
-        response = requests.post(endpoint, params={"key": api_key}, json={
-            "contents": [{"parts": [{"text": image_prompt}]}],
-            "generationConfig": {"responseModalities": ["IMAGE"]},
-        }, timeout=120)
+        response = requests.post(
+            endpoint,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "prompt": image_prompt,
+                "size": "1024x1024",
+                "quality": quality,
+                "output_format": "png",
+                "n": 1,
+            },
+            timeout=180,
+        )
         if not response.ok:
             detail = ""
             try:
-                detail = str(response.json().get("error", {}).get("message", ""))
+                payload = response.json()
+                error = payload.get("error", {}) if isinstance(payload, dict) else {}
+                detail = str(error.get("message") or error.get("code") or "")
             except Exception:
                 pass
+            # Never include the credential in an error message or log.
             detail = detail.replace(api_key, "[hidden API key]")
-            raise ProviderError(f"AI image generation failed (HTTP {response.status_code})" + (f": {detail[:280]}" if detail else ""))
+            raise ProviderError(
+                f"OpenAI image generation failed (HTTP {response.status_code})"
+                + (f": {detail[:350]}" if detail else "")
+            )
         payload = response.json()
-        for candidate in payload.get("candidates", []):
-            for part in candidate.get("content", {}).get("parts", []):
-                inline = part.get("inlineData") or part.get("inline_data")
-                if inline and inline.get("data"):
-                    return base64.b64decode(inline["data"])
-        raise ProviderError("AI image model returned text but no image. Check the selected image model and quota.")
+        data = payload.get("data", [])
+        if data and data[0].get("b64_json"):
+            return base64.b64decode(data[0]["b64_json"])
+        raise ProviderError("OpenAI image API returned no image data. Check model access and API billing.")
     except requests.RequestException as exc:
-        raise ProviderError(f"AI image generation request failed: {type(exc).__name__}") from exc
+        raise ProviderError(f"OpenAI image generation request failed: {type(exc).__name__}") from exc
 
 
 def generate_canva_design(draft: ContentDraft) -> dict:
