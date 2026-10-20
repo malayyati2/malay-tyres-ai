@@ -1364,7 +1364,7 @@ def render_connections() -> None:
     st.info("This app uses Canva Connect OAuth for template autofill/export and attempts Canva-native AI image generation first; Cloudflare Workers AI is an optional fallback. Canva image generation is a preview API and consumes Canva AI credits. The one-click diagnostic makes read-only checks for Google, Canva, Instagram and WhatsApp and sends one tiny Gemini test request. It does not generate an image, publish a post, or send a message. Secrets are never displayed.", icon=":material/info:")
     descriptions = {
         "Google Business Profile": "Read new reviews and publish approved replies through Google OAuth.",
-        "Cloudflare image generation": "Creates a fresh image for each campaign; the image is uploaded to Canva automatically.",
+        "Image generation": "Uses Canva AI with the connected Canva account; Cloudflare Workers AI is an optional fallback.",
         "Canva": "Create and export the branded visual from a Canva brand template.",
         "Instagram": "Publish approved feed posts and stories through the Instagram Graph API.",
         "WhatsApp": "Send approved image messages through the WhatsApp Cloud API.",
@@ -1373,7 +1373,7 @@ def render_connections() -> None:
         with st.container(border=True):
             key_ready = {
                 "Google Business Profile": google_connected(),
-                "Cloudflare image generation": bool(secret("CLOUDFLARE_ACCOUNT_ID") and secret("CLOUDFLARE_API_TOKEN")),
+                "Image generation": bool((canva_access_token() and secret("CANVA_BRAND_TEMPLATE_ID")) or (secret("CLOUDFLARE_ACCOUNT_ID") and secret("CLOUDFLARE_API_TOKEN"))),
                 "Canva": canva_ready(),
                 "Instagram": instagram_ready(),
                 "WhatsApp": whatsapp_ready(),
