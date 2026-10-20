@@ -872,9 +872,25 @@ def generate_canva_design(draft: ContentDraft) -> dict:
         access_token=canva_access_token(),
         brand_template_id=secret("CANVA_BRAND_TEMPLATE_ID"),
     )
-    with st.spinner("Generating a fresh campaign image..."):
-        image_bytes = generate_fresh_campaign_image(draft.image_prompt)
-    asset_id = adapter.upload_image_asset(image_bytes, name=f"Malay Tyres {draft.title[:30]} visual")
+    asset_name = f"Malay Tyres {draft.title[:30]} visual"
+    try:
+        # Prefer Canva-native image generation: it uses the already-connected Canva OAuth
+        # account and does not require a separate Cloudflare account/token.
+        with st.spinner("Generating a fresh image with Canva AI..."):
+            asset_id = adapter.generate_image_asset(draft.image_prompt, name=asset_name)
+    except ProviderError as canva_error:
+        # Preserve the optional Cloudflare route as a fallback if the user configured it.
+        if not (secret("CLOUDFLARE_ACCOUNT_ID").strip() and secret("CLOUDFLARE_API_TOKEN").strip()):
+            raise ProviderError(
+                f"Canva AI image generation could not complete: {canva_error}. "
+                "Canva's image-generation endpoint is a preview API and may need to be enabled for this Canva app; "
+                "it also consumes Canva AI credits. If Canva reports image generation is not enabled, the app owner "
+                "must enable that capability or configure the optional Cloudflare fallback."
+            ) from canva_error
+        with st.spinner("Canva AI is unavailable; trying the configured Cloudflare image fallback..."):
+            image_bytes = generate_fresh_campaign_image(draft.image_prompt)
+        asset_id = adapter.upload_image_asset(image_bytes, name=asset_name)
+
     return adapter.autofill_export(
         {
             field_title: draft.title,
