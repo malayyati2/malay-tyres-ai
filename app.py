@@ -565,6 +565,106 @@ def canva_authorization_url() -> str | None:
     return "https://www.canva.com/api/oauth/authorize?" + urlencode(params)
 
 
+def canva_diagnostics() -> dict[str, object]:
+    """Run read-only Canva checks and report configuration without exposing credentials."""
+    results: dict[str, object] = {}
+    token = canva_access_token()
+    if not token:
+        results["OAuth token"] = ("fail", "No usable access token found. Reconnect Canva from this page.")
+        results["Brand Template ID"] = ("skip", "Skipped because there is no usable Canva token.")
+        results["Template fields"] = ("skip", "Skipped because there is no usable Canva token.")
+        return results
+
+    try:
+        response = requests.get(
+            "https://api.canva.com/rest/v1/users/me",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=20,
+        )
+        if response.ok:
+            results["OAuth token"] = ("pass", "Canva accepted the saved token.")
+        else:
+            results["OAuth token"] = ("fail", f"Canva rejected the token (HTTP {response.status_code}). Reconnect Canva if needed.")
+            results["Brand Template ID"] = ("skip", "Skipped because Canva did not accept the token.")
+            results["Template fields"] = ("skip", "Skipped because Canva did not accept the token.")
+            return results
+    except requests.RequestException as exc:
+        results["OAuth token"] = ("fail", f"Could not reach Canva ({type(exc).__name__}). Try again.")
+        results["Brand Template ID"] = ("skip", "Skipped because Canva could not be reached.")
+        results["Template fields"] = ("skip", "Skipped because Canva could not be reached.")
+        return results
+
+    template_id = secret("CANVA_BRAND_TEMPLATE_ID").strip()
+    if not template_id:
+        results["Brand Template ID"] = ("fail", "CANVA_BRAND_TEMPLATE_ID is missing in Streamlit Secrets.")
+        results["Template fields"] = ("skip", "Skipped because no template ID is configured.")
+        return results
+
+    root = "https://api.canva.com/rest/v1"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    try:
+        response = requests.get(
+            f"{root}/brand-templates/{template_id}", headers=headers, timeout=20
+        )
+        if response.ok:
+            payload = response.json()
+            template = payload.get("brand_template", {})
+            results["Brand Template ID"] = (
+                "pass",
+                f"Template is accessible: {template.get('title') or 'title not returned'} (ID matches configured value).",
+            )
+        else:
+            results["Brand Template ID"] = (
+                "fail",
+                f"Canva could not access the configured template (HTTP {response.status_code}). Check the ID, account access, and brandtemplate:meta:read permission.",
+            )
+            results["Template fields"] = ("skip", "Skipped because the template could not be accessed.")
+            return results
+        response = requests.get(
+            f"{root}/brand-templates/{template_id}/dataset", headers=headers, timeout=20
+        )
+        if response.ok:
+            dataset = response.json().get("dataset", {})
+            field_names = sorted(str(name) for name in dataset.keys())
+            expected = {
+                secret("CANVA_TITLE_FIELD", "TITLE"),
+                secret("CANVA_BODY_FIELD", "BODY"),
+                secret("CANVA_CTA_FIELD", "CTA"),
+                secret("CANVA_IMAGE_FIELD", "IMAGE"),
+            }
+            found = [name for name in field_names if name in expected]
+            missing = sorted(expected - set(field_names))
+            summary = "Available fields: " + (", ".join(field_names) if field_names else "none returned")
+            if missing:
+                summary += ". Configured field names not found: " + ", ".join(missing)
+                results["Template fields"] = ("warn", summary)
+            else:
+                results["Template fields"] = ("pass", summary)
+        else:
+            results["Template fields"] = (
+                "fail",
+                f"Canva could not read template fields (HTTP {response.status_code}). Check brandtemplate:content:read permission.",
+            )
+    except requests.RequestException as exc:
+        results["Template fields"] = ("fail", f"Could not complete the template check ({type(exc).__name__}). Try again.")
+    except (ValueError, TypeError):
+        results["Template fields"] = ("fail", "Canva returned an unexpected template response.")
+    return results
+
+
+def image_generation_config_status() -> tuple[str, str]:
+    account_id = secret("CLOUDFLARE_ACCOUNT_ID").strip()
+    api_token = secret("CLOUDFLARE_API_TOKEN").strip()
+    if account_id and api_token:
+        return ("pass", "Cloudflare Workers AI credentials are present. This check does not spend image-generation credits.")
+    missing = []
+    if not account_id:
+        missing.append("CLOUDFLARE_ACCOUNT_ID")
+    if not api_token:
+        missing.append("CLOUDFLARE_API_TOKEN")
+    return ("fail", "Missing Streamlit Secrets: " + ", ".join(missing) + ". No image-generation request was made.")
+
+
 def canva_ready() -> bool:
     return bool(canva_access_token() and secret("CANVA_BRAND_TEMPLATE_ID"))
 
@@ -1128,10 +1228,10 @@ def render_content_studio() -> None:
 def render_connections() -> None:
     st.header("Connections and guardrails")
     st.write("Configure Canva, Instagram and WhatsApp once in Streamlit secrets. The content studio then creates the Canva visual and publishes only after approval.")
-    st.info("Canva’s public REST API does not expose Magic Media text-to-image generation. This agent generates a fresh image with Gemini, uploads it to your Canva media library, and fills the Canva template’s IMAGE field. Canva still handles template layout and export.", icon=":material/info:")
+    st.info("This app uses Canva Connect OAuth for template autofill/export and Cloudflare Workers AI (FLUX) to generate a fresh image, which is uploaded to Canva. The diagnostic below checks credentials and template fields without displaying secrets or generating an image.", icon=":material/info:")
     descriptions = {
         "Google Business Profile": "Read new reviews and publish approved replies through Google OAuth.",
-        "Gemini image generation": "Creates a fresh image for each campaign; the image is uploaded to Canva automatically.",
+        "Cloudflare image generation": "Creates a fresh image for each campaign; the image is uploaded to Canva automatically.",
         "Canva": "Create and export the branded visual from a Canva brand template.",
         "Instagram": "Publish approved feed posts and stories through the Instagram Graph API.",
         "WhatsApp": "Send approved image messages through the WhatsApp Cloud API.",
@@ -1140,7 +1240,7 @@ def render_connections() -> None:
         with st.container(border=True):
             key_ready = {
                 "Google Business Profile": google_connected(),
-                "Gemini image generation": bool(gemini_api_key()),
+                "Cloudflare image generation": bool(secret("CLOUDFLARE_ACCOUNT_ID") and secret("CLOUDFLARE_API_TOKEN")),
                 "Canva": canva_ready(),
                 "Instagram": instagram_ready(),
                 "WhatsApp": whatsapp_ready(),
@@ -1197,6 +1297,24 @@ def render_connections() -> None:
             st.info("Add CANVA_CLIENT_ID, CANVA_CLIENT_SECRET and CANVA_REDIRECT_URI to Streamlit secrets, then this button will appear.", icon=":material/key:")
         if st.session_state.canva_oauth_error:
             st.error(st.session_state.canva_oauth_error, icon=":material/error:")
+        if st.button("Run safe Canva + image configuration check", key="canva_safe_diagnostics", icon=":material/health_and_safety:", width="stretch"):
+            with st.spinner("Checking Canva authorization and template configuration..."):
+                checks = canva_diagnostics()
+                image_status, image_message = image_generation_config_status()
+                checks["Image-generation configuration"] = (image_status, image_message)
+                st.session_state["canva_diagnostic_results"] = checks
+        checks = st.session_state.get("canva_diagnostic_results")
+        if checks:
+            st.markdown("**Diagnostic results**")
+            for check_name, (status, message) in checks.items():
+                if status == "pass":
+                    st.success(f"{check_name}: {message}", icon=":material/check_circle:")
+                elif status == "warn":
+                    st.warning(f"{check_name}: {message}", icon=":material/warning:")
+                elif status == "skip":
+                    st.info(f"{check_name}: {message}", icon=":material/info:")
+                else:
+                    st.error(f"{check_name}: {message}", icon=":material/error:")
     st.space("small")
     with st.container(border=True):
         st.subheader("Connect WhatsApp Business App (Coexistence)")
