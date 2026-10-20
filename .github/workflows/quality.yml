@@ -1,0 +1,27 @@
+name: App quality checks
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install application and test dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile application modules
+        run: python -m compileall -q app.py tyre_agents
+      - name: Run automated tests
+        run: pytest -q
