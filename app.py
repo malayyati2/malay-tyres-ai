@@ -980,7 +980,7 @@ def render_generated_design(draft: ContentDraft) -> None:
             st.caption("Canva export URLs expire after 24 hours. Publish approved content during this trial window.")
         elif st.session_state.design_error:
             st.warning(st.session_state.design_error, icon=":material/warning:")
-            st.caption("Check GEMINI_API_KEY, Canva OAuth scopes (asset:write and asset:read), and the template IMAGE field. Do not share tokens in chat.")
+            st.caption("Image generation uses OPENAI_API_KEY. Check OpenAI API billing/model access, then Canva OAuth scopes (asset:write and asset:read) and the template IMAGE field. Do not share keys or tokens in chat.")
         else:
             st.info("The agent will generate a new image and insert it into Canva when you submit a brief.", icon=":material/image:")
 
@@ -1070,6 +1070,7 @@ def render_content_studio() -> None:
                 except ProviderError as exc:
                     st.session_state.design_error = str(exc)
                     st.warning("The copy was created, but Canva did not return a design.", icon=":material/warning:")
+                    st.error(f"Design error details: {exc}")
             else:
                 st.session_state.design_error = "Canva is not configured yet. Add CANVA_ACCESS_TOKEN and CANVA_BRAND_TEMPLATE_ID to create the design automatically."
                 st.warning("The copy was created. Connect Canva to generate the visual automatically.", icon=":material/warning:")
