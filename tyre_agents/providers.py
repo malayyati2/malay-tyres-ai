@@ -9,6 +9,7 @@ from __future__ import annotations
 import time
 import base64
 import json
+import uuid
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -120,6 +121,52 @@ class CanvaAdapter:
         asset_id = asset.get("id") if isinstance(asset, dict) else None
         if not asset_id:
             raise ProviderError("Canva image upload completed but did not return an asset ID")
+        return str(asset_id)
+
+    def generate_image_asset(self, prompt: str, *, name: str = "Malay Tyres AI visual",
+                             aspect_ratio: str = "square", poll_attempts: int = 60,
+                             poll_interval_seconds: float = 1.0) -> str:
+        """Generate an image with Canva AI and save it directly to the user's Canva assets.
+
+        Canva currently documents this endpoint as a preview API. It consumes Canva AI
+        credits and requires the user's access token to have the asset:write scope.
+        """
+        if not self.access_token:
+            raise ProviderError("Canva access token is required for image generation")
+        if not prompt or not prompt.strip():
+            raise ProviderError("A non-empty image prompt is required")
+        allowed_ratios = {"square", "landscape", "portrait", "landscape_3_2", "portrait_2_3", "portrait_4_5"}
+        if aspect_ratio not in allowed_ratios:
+            raise ProviderError("Unsupported Canva image aspect ratio")
+        s = _session(self.session)
+        root = self.base_url.rstrip("/")
+        headers = {"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"}
+        payload = _check(
+            s.post(
+                f"{root}/image-generations",
+                headers={**headers, "Content-Type": "application/json"},
+                json={
+                    "prompt": prompt.strip()[:5000],
+                    "idempotency_key": str(uuid.uuid4()),
+                    "aspect_ratio": aspect_ratio,
+                    "asset_upload": {"type": "upload", "asset_name": name[:255]},
+                },
+            ),
+            "Canva image generation",
+        )
+        job = _job(payload, "Canva image generation")
+        result = job if job.get("status") == "success" else _poll_job(
+            s, f"{root}/image-generations/{job['id']}", headers, "Canva image generation",
+            attempts=poll_attempts, interval_seconds=poll_interval_seconds,
+        )
+        generation_result = result.get("result", {})
+        image = generation_result.get("image", {}) if isinstance(generation_result, dict) else {}
+        asset = image.get("asset", {}) if isinstance(image, dict) else {}
+        asset_id = asset.get("id") if isinstance(asset, dict) else None
+        if not asset_id:
+            error = result.get("error", {}) if isinstance(result, dict) else {}
+            detail = " — ".join(str(error[k]) for k in ("code", "message") if isinstance(error, dict) and error.get(k))
+            raise ProviderError("Canva image generation completed without a saved asset" + (f": {detail}" if detail else ""))
         return str(asset_id)
 
     def autofill_export(self, text_fields: Mapping[str, str], *, title: str = "Malay Tyres campaign",
