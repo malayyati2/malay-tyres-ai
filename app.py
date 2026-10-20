@@ -9,6 +9,7 @@ import hmac
 import sqlite3
 import time
 import os
+import uuid
 
 import requests
 from zoneinfo import ZoneInfo
@@ -22,11 +23,21 @@ from tyre_agents.core import (
     InMemoryPublisher,
     SAMPLE_REVIEWS,
     generate_content,
+    DEFAULT_SALUTATION,
+    SALUTATIONS,
     generate_reply,
+    regenerate_reply,
+    select_salutation,
     publish_approved,
 )
 from tyre_agents.canva_oauth import create_pkce_request, exchange_code
-from tyre_agents.providers import CanvaAdapter, InstagramAdapter, ProviderError, WhatsAppAdapter
+from tyre_agents.providers import (
+    CanvaAdapter,
+    GeminiImageAdapter,
+    InstagramAdapter,
+    ProviderError,
+    WhatsAppAdapter,
+)
 from tyre_agents.gemini_text import GeminiTextGenerator
 
 
@@ -155,7 +166,9 @@ def google_redirect_uri() -> str:
 
 
 def google_connected() -> bool:
-    return bool(st.session_state.get("google_access_token") or oauth_token_get("google")[0])
+    if "google_stored_access_token" not in st.session_state:
+        st.session_state.google_stored_access_token = oauth_token_get("google")[0]
+    return bool(st.session_state.get("google_access_token") or st.session_state.google_stored_access_token)
 
 def google_state_secret() -> str:
     return secret("GOOGLE_OAUTH_STATE_SECRET") or secret("GOOGLE_CLIENT_SECRET")
@@ -353,7 +366,13 @@ def sync_google_reviews() -> int:
         else:
             reply_text = generate_review_reply(review)
             status = "Ready to review"
-        synced[review_id] = {"review": review, "reply": reply_text, "status": status}
+        synced[review_id] = {
+            "review": review,
+            "reply": reply_text,
+            "salutation": prior.get("salutation", DEFAULT_SALUTATION) if prior else DEFAULT_SALUTATION,
+            "reply_version": prior.get("reply_version", 0) if prior else 0,
+            "status": status,
+        }
         review_names[review_id] = review_name
     st.session_state.reviews = synced
     st.session_state.google_review_names = review_names
@@ -369,7 +388,15 @@ def publish_google_review_reply(review_id: str, reply: str) -> None:
 
 
 def canva_access_token() -> str:
-    stored_access, stored_refresh, stored_expiry = oauth_token_get("canva")
+    if "canva_stored_token" not in st.session_state:
+        stored_access, stored_refresh, stored_expiry = oauth_token_get("canva")
+        st.session_state.canva_stored_token = stored_access
+        st.session_state.canva_stored_refresh = stored_refresh
+        st.session_state.canva_stored_expiry = stored_expiry
+    else:
+        stored_access = st.session_state.canva_stored_token
+        stored_refresh = st.session_state.canva_stored_refresh
+        stored_expiry = st.session_state.canva_stored_expiry
     token = str(st.session_state.get("canva_access_token") or stored_access or secret("CANVA_ACCESS_TOKEN"))
     refresh_token = str(st.session_state.get("canva_refresh_token") or stored_refresh or secret("CANVA_REFRESH_TOKEN"))
     expires_at = float(st.session_state.get("canva_token_expires_at", 0) or stored_expiry or 0)
@@ -394,12 +421,23 @@ def canva_access_token() -> str:
         st.session_state.canva_access_token = token
         st.session_state.canva_refresh_token = refresh_token
         st.session_state.canva_token_expires_at = expires_at
+        st.session_state.canva_stored_token = token
+        st.session_state.canva_stored_refresh = refresh_token
+        st.session_state.canva_stored_expiry = expires_at
         oauth_token_save("canva", token, refresh_token, expires_at)
     return token
 
 
 def gemini_api_key() -> str:
     return secret("GEMINI_API_KEY")
+
+
+def gemini_image_model() -> str:
+    return secret("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+
+
+def canva_image_model() -> str:
+    return secret("CANVA_IMAGE_MODEL")
 
 
 def gemini_model() -> str:
@@ -415,6 +453,8 @@ def generate_review_reply(review) -> str:
     review_text = str(getattr(review, "text", "") or "").strip()
     rating = int(getattr(review, "rating", 5) or 5)
     lowered = review_text.casefold()
+    greeting = select_salutation(getattr(review, "salutation", None))
+    greeting_for_prompt = greeting.replace("Ma'am", "Ma’am")
 
     # Use the language model when configured, with strict grounding in the review.
     api_key = gemini_api_key()
@@ -424,7 +464,7 @@ def generate_review_reply(review) -> str:
             endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             prompt = (
                 "Write one short, polite Google Business Profile owner reply for Malay Tyres, Ujjain. "
-                "CRITICAL RULES: Never use, repeat, or infer the reviewer's name. Start exactly with 'Dear Sir/Ma’am,'. "
+                f"CRITICAL RULES: Never use, repeat, or infer the reviewer's name. Start exactly with '{greeting_for_prompt},'. "
                 "Mention the exact service the reviewer actually mentions (examples: wheel alignment, Teflon coating, "
                 "wheel balancing, tyre rotation, tyre inspection, car washing, interior cleaning, headlight cleaning, "
                 "rim work, engine work, suspension work, brake work, general mechanical work). Do not mention tyres "
@@ -448,8 +488,8 @@ def generate_review_reply(review) -> str:
                 if text:
                     if text.casefold().startswith(("dear sir", "dear ma'am", "dear madam", "hello", "hi ")):
                         text = text.split("\n", 1)[-1].strip() if text.casefold().startswith(("hello", "hi ")) else text
-                    if not text.casefold().startswith(("dear sir", "dear ma’am", "dear ma'am")):
-                        text = "Dear Sir/Ma’am,\n\n" + text
+                    if not text.casefold().startswith(("dear sir", "dear ma’am", "dear ma'am", "dear customer")):
+                        text = f"{greeting_for_prompt},\n\n" + text
                     return text
         except Exception:
             pass
@@ -474,15 +514,15 @@ def generate_review_reply(review) -> str:
     service = next((label for terms, label in service_patterns if any(term in lowered for term in terms)), "")
     if rating >= 4:
         if service:
-            return f"Dear Sir/Ma’am, thank you for your kind feedback about our {service}. We truly appreciate your trust in Malay Tyres and look forward to serving you again."
-        return "Dear Sir/Ma’am, thank you for your valuable feedback and support. We truly appreciate your trust in Malay Tyres and look forward to serving you again."
+            return f"{greeting_for_prompt}, thank you for your kind feedback about our {service}. We truly appreciate your trust in Malay Tyres and look forward to serving you again."
+        return f"{greeting_for_prompt}, thank you for your valuable feedback and support. We truly appreciate your trust in Malay Tyres and look forward to serving you again."
     if rating == 3:
         if service:
-            return f"Dear Sir/Ma’am, thank you for sharing your feedback about our {service}. We’ll use your comments to improve and would appreciate the opportunity to serve you better."
-        return "Dear Sir/Ma’am, thank you for your feedback. We’ll use your comments to improve and would appreciate the opportunity to serve you better."
+            return f"{greeting_for_prompt}, thank you for sharing your feedback about our {service}. We’ll use your comments to improve and would appreciate the opportunity to serve you better."
+        return f"{greeting_for_prompt}, thank you for your feedback. We’ll use your comments to improve and would appreciate the opportunity to serve you better."
     if service:
-        return f"Dear Sir/Ma’am, we’re sorry your experience with our {service} did not meet expectations. Please contact Malay Tyres so we can understand the issue and work to make it right."
-    return "Dear Sir/Ma’am, we’re sorry your experience did not meet expectations. Please contact Malay Tyres so we can understand the issue and work to make it right."
+        return f"{greeting_for_prompt}, we’re sorry your experience with our {service} did not meet expectations. Please contact Malay Tyres so we can understand the issue and work to make it right."
+    return f"{greeting_for_prompt}, we’re sorry your experience did not meet expectations. Please contact Malay Tyres so we can understand the issue and work to make it right."
 
 
 def canva_redirect_uri() -> str:
@@ -783,6 +823,10 @@ def run_all_api_diagnostics() -> dict[str, tuple[str, str]]:
 
 
 def canva_ready() -> bool:
+    return bool(canva_access_token())
+
+
+def canva_template_ready() -> bool:
     return bool(canva_access_token() and secret("CANVA_BRAND_TEMPLATE_ID"))
 
 
@@ -862,15 +906,35 @@ def generate_fresh_campaign_image(prompt: str) -> bytes:
     except requests.RequestException as exc:
         raise ProviderError(f"Cloudflare image generation request failed: {type(exc).__name__}") from exc
 
+def _canva_text_fields(draft: ContentDraft) -> dict[str, str]:
+    return {
+        secret("CANVA_TITLE_FIELD", "TITLE"): draft.title,
+        secret("CANVA_BODY_FIELD", "BODY"): draft.body,
+        secret("CANVA_CTA_FIELD", "CTA"): secret("CANVA_CTA_TEXT", "Book your tyre check today"),
+    }
+
+
+def _canva_adapter() -> CanvaAdapter:
+    return CanvaAdapter(
+        access_token=canva_access_token(),
+        brand_template_id=secret("CANVA_BRAND_TEMPLATE_ID"),
+    )
+
+
+def _finish_canva_design(draft: ContentDraft, asset_id: str) -> dict:
+    return _canva_adapter().autofill_export(
+        _canva_text_fields(draft),
+        image_fields={secret("CANVA_IMAGE_FIELD", "IMAGE"): asset_id},
+        title=draft.title,
+    )
+
+
 def generate_canva_design(draft: ContentDraft) -> dict:
     field_title = secret("CANVA_TITLE_FIELD", "TITLE")
     field_body = secret("CANVA_BODY_FIELD", "BODY")
     field_cta = secret("CANVA_CTA_FIELD", "CTA")
     field_image = secret("CANVA_IMAGE_FIELD", "IMAGE")
-    adapter = CanvaAdapter(
-        access_token=canva_access_token(),
-        brand_template_id=secret("CANVA_BRAND_TEMPLATE_ID"),
-    )
+    adapter = _canva_adapter()
     asset_name = f"Malay Tyres {draft.title[:30]} visual"
     try:
         # Prefer Canva-native image generation: it uses the already-connected Canva OAuth
@@ -890,15 +954,52 @@ def generate_canva_design(draft: ContentDraft) -> dict:
             image_bytes = generate_fresh_campaign_image(draft.image_prompt)
         asset_id = adapter.upload_image_asset(image_bytes, name=asset_name)
 
-    return adapter.autofill_export(
-        {
-            field_title: draft.title,
-            field_body: draft.body,
-            field_cta: secret("CANVA_CTA_TEXT", "Book your tyre check today"),
-        },
-        image_fields={field_image: asset_id},
-        title=draft.title,
+    return _finish_canva_design(draft, asset_id)
+
+
+def generate_gemini_design(draft: ContentDraft) -> dict:
+    """Generate with Gemini, then optionally render the image through Canva."""
+    prompt = (
+        "Create a fresh, realistic premium marketing image for Malay Tyres, a local Indian tyre and vehicle-care business. "
+        "Show a clean professional tyre-service or safe-road-travel scene with natural lighting and a believable car or SUV. "
+        "No readable text, watermark, invented logo, fake phone number, or brand badge. Leave clean space for Canva overlay text. "
+        f"Campaign direction: {draft.image_prompt}"
     )
+    image = GeminiImageAdapter(gemini_api_key(), model=gemini_image_model()).generate(prompt, aspect_ratio="9:16" if Destination.INSTAGRAM_STORY in draft.destinations else "4:5")
+    if not canva_template_ready():
+        return {**image, "provider": "gemini", "label": "Gemini image", "publishable": False}
+    adapter = _canva_adapter()
+    asset_id = adapter.upload_image_asset(image["image_bytes"], name=f"Malay Tyres Gemini {draft.title[:30]}")
+    design = _finish_canva_design(draft, asset_id)
+    return {
+        **design,
+        "provider": "gemini",
+        "label": "Gemini image in Canva",
+        "image_bytes": image["image_bytes"],
+        "mime_type": image["mime_type"],
+        "publishable": True,
+    }
+
+
+def generate_visual_options(draft: ContentDraft) -> tuple[dict[str, dict], tuple[str, ...]]:
+    """Create one image with Gemini and one with Canva for side-by-side review."""
+    options: dict[str, dict] = {}
+    errors: list[str] = []
+    if gemini_api_key():
+        try:
+            options["Gemini"] = generate_gemini_design(draft)
+        except ProviderError as exc:
+            errors.append(f"Gemini image: {exc}")
+    else:
+        errors.append("Gemini image: add GEMINI_API_KEY to Streamlit Secrets")
+    if canva_template_ready():
+        try:
+            options["Canva"] = {**generate_canva_design(draft), "label": "Canva AI image", "publishable": True}
+        except ProviderError as exc:
+            errors.append(f"Canva image: {exc}")
+    else:
+        errors.append("Canva image: connect Canva and configure CANVA_BRAND_TEMPLATE_ID")
+    return options, tuple(errors)
 
 def generate_campaign_draft(topic: str, tone: str, draft_id: str, destinations: tuple[Destination, ...]) -> tuple[ContentDraft, str]:
     """Prefer Gemini for copy, with a deterministic fallback for offline trials."""
@@ -999,6 +1100,8 @@ def initialize_state() -> None:
             review.review_id: {
                 "review": review,
                 "reply": generate_review_reply(review),
+                "salutation": DEFAULT_SALUTATION,
+                "reply_version": 0,
                 "status": "Ready to review",
             }
             for review in SAMPLE_REVIEWS
@@ -1006,6 +1109,10 @@ def initialize_state() -> None:
     st.session_state.setdefault("queue", ApprovalQueue())
     st.session_state.setdefault("draft", None)
     st.session_state.setdefault("generated_design", None)
+    st.session_state.setdefault("image_candidates", {})
+    st.session_state.setdefault("selected_image_provider", None)
+    st.session_state.setdefault("image_generation_number", 0)
+    st.session_state.setdefault("image_errors", ())
     st.session_state.setdefault("design_error", None)
     st.session_state.setdefault("canva_access_token", "")
     st.session_state.setdefault("canva_refresh_token", "")
@@ -1132,7 +1239,16 @@ def render_review_card(review_id: str, item: dict) -> None:
         with top_right:
             badge(item["status"], "green" if item["status"] == "Published" else "orange")
         st.write(f'“{review.text}”')
-        reply_key = f"reply_{review_id}"
+        salutation = st.selectbox(
+            "Salutation",
+            SALUTATIONS,
+            index=SALUTATIONS.index(item.get("salutation", DEFAULT_SALUTATION))
+            if item.get("salutation", DEFAULT_SALUTATION) in SALUTATIONS else 0,
+            key=f"salutation_{review_id}_{item.get('reply_version', 0)}",
+            help="The app never uses the customer name. Choose a salutation explicitly; Dear Customer is the safe default when gender is unknown.",
+        )
+        item["salutation"] = salutation
+        reply_key = f"reply_{review_id}_{item.get('reply_version', 0)}"
         edited_reply = st.text_area(
             "Suggested reply",
             value=item["reply"],
@@ -1142,6 +1258,12 @@ def render_review_card(review_id: str, item: dict) -> None:
         )
         buttons = st.container(horizontal=True, vertical_alignment="center")
         with buttons:
+            if st.button("Regenerate reply", key=f"regenerate_{review_id}", icon=":material/refresh:"):
+                item["reply"] = regenerate_reply(review, item["reply"], salutation=salutation)
+                item["reply_version"] = item.get("reply_version", 0) + 1
+                item["status"] = "Ready to review"
+                add_activity("Review agent", f"Regenerated a different reply for review {review_id}")
+                st.rerun()
             if st.button("Save reply", key=f"save_{review_id}", icon=":material/save:"):
                 item["reply"] = edited_reply
                 item["status"] = "Approved for publishing"
@@ -1160,7 +1282,8 @@ def render_review_card(review_id: str, item: dict) -> None:
 
 def render_reviews() -> None:
     st.header("Google Business Profile review inbox")
-    st.write("Real Google reviews are loaded here. Replies remain drafts until you save and explicitly publish each one.")
+    st.write("Real Google reviews are loaded here. Replies never use the customer name, each review has its own wording, and you can regenerate any reply before publishing.")
+    st.caption("The app does not reliably infer gender from a name. Choose Dear Sir, Dear Ma'am, or Dear Customer for each reviewer.")
     if google_connected():
         st.success(f"Google Business Profile connected · {st.session_state.get('google_location_title', 'Business location')}")
         if st.button("Sync real Google reviews", type="primary", icon=":material/refresh:"):
@@ -1203,23 +1326,46 @@ def render_draft_preview(draft: ContentDraft) -> None:
 
 def render_generated_design(draft: ContentDraft) -> None:
     with st.container(border=True):
-        st.subheader("Fresh AI image + Canva design")
-        generated_design = st.session_state.generated_design
-        if generated_design is not None:
-            st.image(
-                generated_design["image_url"],
-                caption="A fresh AI-generated image inserted into your Canva Brand Template",
-                alt="Malay Tyres social media creative with a newly generated AI image",
-                width="stretch",
-            )
-            if generated_design.get("design_url"):
-                st.link_button("Open and edit in Canva", generated_design["design_url"], icon=":material/edit:", width="stretch")
-            st.caption("Canva export URLs expire after 24 hours. Publish approved content during this trial window.")
-        elif st.session_state.design_error:
-            st.warning(st.session_state.design_error, icon=":material/warning:")
-            st.caption("Image generation uses Cloudflare Workers AI FLUX.1 schnell. Check CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, Workers AI limits, Canva OAuth scopes (asset:write and asset:read), and the template IMAGE field. Do not share keys or tokens in chat.")
+        st.subheader("Compare Gemini and Canva images")
+        candidates = st.session_state.image_candidates
+        selected = st.session_state.get("selected_image_provider")
+        if candidates:
+            st.caption("Both providers create a fresh image for this campaign. Select the version you prefer before approving.")
+            columns = st.columns(len(candidates))
+            for column, provider in zip(columns, candidates):
+                candidate = candidates[provider]
+                with column:
+                    badge("Selected" if provider == selected else provider, "green" if provider == selected else "blue")
+                    if candidate.get("image_url"):
+                        st.image(candidate["image_url"], caption=candidate.get("label", provider), alt=f"{provider}-generated Malay Tyres campaign image", width="stretch")
+                    elif candidate.get("image_bytes"):
+                        st.image(candidate["image_bytes"], caption=candidate.get("label", provider), alt=f"{provider}-generated Malay Tyres campaign image", width="stretch")
+                        st.download_button(
+                            "Download Gemini image",
+                            data=candidate["image_bytes"],
+                            file_name=f"{draft.draft_id}-gemini.png",
+                            mime=candidate.get("mime_type", "image/png"),
+                            key=f"download_{draft.draft_id}_{provider}",
+                            width="stretch",
+                        )
+                    if st.button(
+                        "Use this image",
+                        key=f"use_{draft.draft_id}_{provider}",
+                        type="primary" if provider == selected else "secondary",
+                        width="stretch",
+                    ):
+                        st.session_state.selected_image_provider = provider
+                        st.session_state.generated_design = candidate
+                        st.rerun()
+                    if candidate.get("design_url"):
+                        st.link_button("Open in Canva", candidate["design_url"], icon=":material/edit:", width="stretch")
+            if selected and not candidates[selected].get("image_url"):
+                st.warning("This Gemini option can be previewed and downloaded, but social publishing needs a public Canva image URL. Select the Canva option to publish.", icon=":material/info:")
+        elif st.session_state.image_errors:
+            for error in st.session_state.image_errors:
+                st.warning(error, icon=":material/warning:")
         else:
-            st.info("The agent will generate a new image and insert it into Canva when you submit a brief.", icon=":material/image:")
+            st.info("Gemini and Canva will create separate image options when you submit a campaign.", icon=":material/image:")
 
 
 def render_content_studio() -> None:
@@ -1296,21 +1442,23 @@ def render_content_studio() -> None:
             st.session_state.queue.add(draft)
             st.session_state.draft = draft
             st.session_state.generated_design = None
+            st.session_state.image_candidates = {}
+            st.session_state.selected_image_provider = None
+            st.session_state.image_generation_number = 0
+            st.session_state.image_errors = ()
             st.session_state.design_error = None
-            add_activity("Content agent", f"Generated copy with {copy_provider} and a Canva design brief for {topic}")
-            if canva_ready():
-                try:
-                    with st.spinner("Creating the branded visual automatically in Canva..."):
-                        st.session_state.generated_design = generate_canva_design(draft)
-                    add_activity("Canva agent", "Created and exported a branded visual from the Canva template")
-                    st.success("Draft and Canva design created automatically. Review both below.", icon=":material/check_circle:")
-                except ProviderError as exc:
-                    st.session_state.design_error = str(exc)
-                    st.warning("The copy was created, but Canva did not return a design.", icon=":material/warning:")
-                    st.error(f"Design error details: {exc}")
+            add_activity("Content agent", f"Generated copy with {copy_provider} for {topic}")
+            with st.spinner("Generating one fresh Gemini image and one fresh Canva image..."):
+                options, image_errors = generate_visual_options(draft)
+            st.session_state.image_candidates = options
+            st.session_state.image_errors = image_errors
+            if options:
+                st.session_state.selected_image_provider = next(iter(options))
+                st.session_state.generated_design = options[st.session_state.selected_image_provider]
+                add_activity("Image agents", f"Generated {len(options)} image option(s) for comparison")
+                st.success("Caption and image options are ready. Choose the better image below.", icon=":material/check_circle:")
             else:
-                st.session_state.design_error = "Canva is not configured yet. Add CANVA_ACCESS_TOKEN and CANVA_BRAND_TEMPLATE_ID to create the design automatically."
-                st.warning("The copy was created. Connect Canva to generate the visual automatically.", icon=":material/warning:")
+                st.warning("The caption was created, but no image provider returned a result. Check Connections and try again.", icon=":material/warning:")
 
     draft = st.session_state.draft
     if draft is None:
@@ -1319,6 +1467,16 @@ def render_content_studio() -> None:
 
     st.space("small")
     render_draft_preview(draft)
+    if st.button("Regenerate both images", icon=":material/refresh:", width="stretch"):
+        st.session_state.image_generation_number += 1
+        with st.spinner("Generating new Gemini and Canva image options..."):
+            options, image_errors = generate_visual_options(draft)
+        st.session_state.image_candidates = options
+        st.session_state.image_errors = image_errors
+        st.session_state.selected_image_provider = next(iter(options), None)
+        st.session_state.generated_design = options.get(st.session_state.selected_image_provider) if st.session_state.selected_image_provider else None
+        add_activity("Image agents", "Regenerated both campaign image options")
+        st.rerun()
     render_generated_design(draft)
     with st.container(border=True):
         st.subheader("2. Review and approve")

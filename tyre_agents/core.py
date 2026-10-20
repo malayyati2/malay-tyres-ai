@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Protocol
+from typing import Literal, Protocol
 
 
 class Destination(str, Enum):
@@ -18,12 +18,18 @@ class Destination(str, Enum):
     WHATSAPP = "whatsapp"
 
 
+Salutation = Literal["Dear Sir", "Dear Ma'am", "Dear Customer"]
+SALUTATIONS: tuple[Salutation, ...] = ("Dear Sir", "Dear Ma'am", "Dear Customer")
+DEFAULT_SALUTATION: Salutation = "Dear Customer"
+
+
 @dataclass(frozen=True)
 class Review:
     review_id: str
     customer_name: str
     rating: int
     text: str
+    salutation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -57,27 +63,58 @@ class ApprovalQueue:
         return tuple(draft for draft in self._drafts.values() if not draft.approved)
 
 
-def generate_reply(review: Review) -> str:
-    """Generate a polite response using rating-aware, deterministic wording."""
+def select_salutation(review_or_salutation: Review | str | None = None) -> Salutation:
+    """Use only an explicit salutation; never infer gender from a name."""
+    requested = review_or_salutation.salutation if isinstance(review_or_salutation, Review) else review_or_salutation
+    if requested is None:
+        return DEFAULT_SALUTATION
+    normalized = " ".join(str(requested).strip().split()).casefold()
+    for salutation in SALUTATIONS:
+        if normalized == salutation.casefold():
+            return salutation
+    return DEFAULT_SALUTATION
+
+
+def reply_variants(review: Review, *, salutation: str | None = None) -> tuple[str, ...]:
+    """Create distinct rating-aware replies without using the reviewer name."""
     if not 1 <= review.rating <= 5:
         raise ValueError("rating must be between 1 and 5")
-    name = review.customer_name.strip() or "there"
+    greeting = select_salutation(review if salutation is None else salutation)
     if review.rating >= 4:
         options = (
-            f"Thank you, {name}! We are delighted you were happy with your tyre service.",
-            f"Thanks so much, {name}, for the kind review. We appreciate your trust in our team!",
+            f"{greeting}, thank you for the lovely review. We are delighted our tyre service met your expectations.",
+            f"{greeting}, we appreciate you taking the time to share this. Your kind feedback means a lot to our team.",
         )
     elif review.rating == 3:
         options = (
-            f"Thank you for your feedback, {name}. We will use it to keep improving our service.",
-            f"Thanks for sharing your experience, {name}. We would welcome the chance to do even better next time.",
+            f"{greeting}, thank you for the balanced feedback. We will use it to keep improving our service.",
+            f"{greeting}, we appreciate you sharing your experience. We would welcome the chance to do even better next time.",
         )
     else:
         options = (
-            f"We are sorry your experience fell short, {name}. Please contact us so we can put this right.",
-            f"Thank you for telling us, {name}. We apologise and would appreciate the opportunity to resolve this.",
+            f"{greeting}, we are sorry your experience fell short. Please contact us so we can put this right.",
+            f"{greeting}, thank you for bringing this to our attention. We apologise and would value the opportunity to resolve it.",
         )
-    return options[_stable_index(review.review_id, len(options))]
+    return options
+
+
+def generate_reply(review: Review, variant: int | None = None, *, salutation: str | None = None) -> str:
+    options = reply_variants(review, salutation=salutation)
+    selected = _stable_index(review.review_id, len(options)) if variant is None else variant % len(options)
+    return options[selected]
+
+
+def regenerate_reply(review: Review, current_reply: str | int | None = None, *, current_variant: int | None = None, salutation: str | None = None) -> str:
+    options = reply_variants(review, salutation=salutation)
+    if current_variant is not None:
+        index = current_variant % len(options)
+    elif isinstance(current_reply, int):
+        index = current_reply % len(options)
+    elif current_reply in options:
+        index = options.index(current_reply)
+    else:
+        index = _stable_index(review.review_id, len(options))
+    return options[(index + 1) % len(options)]
 
 
 def _stable_index(value: str, size: int) -> int:

@@ -2,8 +2,8 @@
 
 A Streamlit MVP for a human-approved multi-agent workflow for Malay Tyres:
 
-- **Review agent**: prepares a distinct, polite reply for each Google Business Profile review.
-- **Content agent**: uses Gemini for campaign copy and automatically creates a branded visual in Canva from a configured brand template.
+- **Review agent**: prepares a distinct, polite reply for each Google Business Profile review without using the customer name; you can choose the salutation and regenerate a reply.
+- **Content agent**: uses Gemini for campaign copy and image generation, and Canva for a second independent image generation so you can compare and select.
 - **Publishing agent**: routes approved assets to selected destinations where a live provider is implemented and configured.
 - **Safety gate**: no content is published by the content studio until the operator approves it.
 
@@ -25,6 +25,7 @@ Create `.streamlit/secrets.toml` locally (it is ignored by Git) and add the foll
 
 ```toml
 GEMINI_API_KEY = "your-google-ai-studio-api-key"
+GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
 
 CLOUDFLARE_ACCOUNT_ID = "your-cloudflare-account-id"
 CLOUDFLARE_API_TOKEN = "your-workers-ai-api-token"
@@ -33,6 +34,7 @@ CANVA_CLIENT_ID = "your-canva-client-id"
 CANVA_CLIENT_SECRET = "your-canva-client-secret"
 CANVA_REDIRECT_URI = "https://your-app-name.streamlit.app"
 CANVA_ACCESS_TOKEN = "your-canva-oauth-access-token"
+CANVA_IMAGE_MODEL = ""
 CANVA_BRAND_TEMPLATE_ID = "your-canva-brand-template-id"
 CANVA_TITLE_FIELD = "TITLE"
 CANVA_BODY_FIELD = "BODY"
@@ -49,13 +51,13 @@ WHATSAPP_RECIPIENT_PHONE = "+91xxxxxxxxxx"
 META_GRAPH_API_VERSION = "v21.0"
 ```
 
-The Canva template must be a published Brand Template with autofill fields matching the configured field names. Canva's public REST APIs support brand-template autofill and PNG export, but do not expose Canva Magic Media text-to-image generation as a REST endpoint. This app therefore creates the design automatically from your branded Canva template; no manual Canva editing step is required during each campaign.
+The Canva template must be a published Brand Template with autofill fields matching the configured field names, including `IMAGE` when you want the generated image inserted into the branded design. Canva AI image generation is a preview API, consumes Canva AI credits, requires the `asset:write` scope, and returns a temporary image/export URL.
 
-Gemini is used for campaign copy. The app attempts Canva's native image-generation REST API first, using the existing Canva OAuth token and the user's Canva AI allowance; this endpoint is currently documented by Canva as a preview API and can fail if image generation is not enabled for the Canva app or the account has no AI credits. Cloudflare Workers AI (FLUX Schnell) is an optional fallback and requires `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`. Create a Gemini API key at https://aistudio.google.com/app/apikey and add it as `GEMINI_API_KEY`. If Gemini is unavailable, the app falls back to deterministic offline campaign copy.
+Gemini is used for both campaign copy and image generation. Canva creates an independent second image, and both options are shown for comparison. Create a Gemini API key at https://aistudio.google.com/app/apikey and add it as `GEMINI_API_KEY`. If Gemini is unavailable, the app keeps the deterministic caption fallback and reports the image-provider error instead of claiming an image was created.
 
 The Connections page includes **Authorize Canva** when `CANVA_CLIENT_ID`, `CANVA_CLIENT_SECRET` and `CANVA_REDIRECT_URI` are configured. Add the exact same redirect URI in the Canva Developer Portal. After authorization, the app exchanges the OAuth code server-side using PKCE. For durable token persistence on Streamlit Cloud, configure the app's Supabase URL and service-role key; otherwise its SQLite fallback lives under `/tmp` and can be lost on restart. Never put secrets in GitHub or chat.
 
-The Instagram image and WhatsApp image message use Canva's exported image URL. Canva export URLs expire after 24 hours, so approve and publish the campaign during that window.
+If a Gemini image is selected and a Canva Brand Template is configured, the Gemini image is uploaded into Canva and exported through the template. Social publishing uses the selected public Canva export URL; approve and publish during its temporary URL window.
 
 ## Run
 
@@ -65,8 +67,8 @@ uv run streamlit run app.py
 
 Open the local URL printed by Streamlit. Use the sidebar to try:
 
-1. **Reviews** → edit a suggested response, save it, then mark it as published.
-2. **Content studio** → choose a topic and destinations, automatically create the copy and Canva visual, edit, approve, then publish to Instagram and/or WhatsApp.
+1. **Reviews** → choose Dear Sir, Dear Ma'am or Dear Customer, regenerate a different reply when needed, edit it, save it, then publish it to Google.
+2. **Content studio** → create the caption plus Gemini and Canva images, select the better option, edit, approve, then publish to Instagram and/or WhatsApp.
 3. **Connections** → inspect the production integration checklist.
 
 ## Test

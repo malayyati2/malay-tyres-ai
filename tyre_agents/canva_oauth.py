@@ -16,6 +16,7 @@ DEFAULT_CANVA_SCOPES = (
     "design:content:write",
     "design:content:read",
     "design:meta:read",
+    "asset:write",
     "brandtemplate:meta:read",
     "brandtemplate:content:read",
 )

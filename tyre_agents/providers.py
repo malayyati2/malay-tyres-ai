@@ -86,6 +86,170 @@ def _poll_job(session: Any, url: str, headers: Mapping[str, str], operation: str
     raise ProviderError(f"{operation} timed out while waiting for Canva")
 
 
+DEFAULT_GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
+DEFAULT_IMAGEN_MODEL = DEFAULT_GEMINI_IMAGE_MODEL
+
+
+class GeneratedImage(dict[str, Any]):
+    """Mapping result that also supports attribute access in callers/tests."""
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
+def _value(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _image_part(response: Any) -> tuple[bytes, str]:
+    """Extract the first inline image from a google-genai response."""
+    parts: list[Any] = []
+    for candidate in _value(response, "candidates", []) or []:
+        content = _value(candidate, "content")
+        parts.extend(_value(content, "parts", []) or [])
+    if not parts:
+        parts.extend(_value(response, "parts", []) or [])
+    for part in parts:
+        inline_data = _value(part, "inline_data")
+        if inline_data is None:
+            continue
+        data = _value(inline_data, "data")
+        mime_type = _value(inline_data, "mime_type") or _value(inline_data, "mimeType")
+        if isinstance(data, str):
+            try:
+                data = base64.b64decode(data, validate=True)
+            except Exception as exc:
+                raise ProviderError("Gemini returned invalid image data") from exc
+        if isinstance(data, bytes) and data:
+            return data, str(mime_type or "image/png")
+    raise ProviderError("Gemini did not return an image")
+
+
+@dataclass
+class GeminiImageAdapter:
+    """Generate a fresh image with the official google-genai client."""
+
+    api_key: str
+    model: str = DEFAULT_GEMINI_IMAGE_MODEL
+    client: Any | None = None
+
+    def _get_client(self) -> Any:
+        if self.client is not None:
+            return self.client
+        if not isinstance(self.api_key, str) or not self.api_key.strip():
+            raise ProviderError("Gemini API key is required")
+        try:
+            from google import genai
+            self.client = genai.Client(api_key=self.api_key)
+        except Exception as exc:
+            raise ProviderError("Gemini client could not be initialized") from exc
+        return self.client
+
+    def generate(self, prompt: str, aspect_ratio: str | None = None) -> GeneratedImage:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ProviderError("Gemini image prompt is required")
+        try:
+            from google.genai import types
+
+            config: Any = types.GenerateContentConfig(response_modalities=["IMAGE"])
+            if aspect_ratio:
+                config.image_config = types.ImageConfig(aspect_ratio=aspect_ratio)
+            response = self._get_client().models.generate_content(
+                model=self.model,
+                contents=prompt.strip(),
+                config=config,
+            )
+            image_bytes, mime_type = _image_part(response)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError("Gemini image generation failed") from exc
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        return GeneratedImage({
+            "provider": "gemini",
+            "model": self.model,
+            "mime_type": mime_type,
+            "base64": encoded,
+            "data_uri": f"data:{mime_type};base64,{encoded}",
+            "image_bytes": image_bytes,
+        })
+
+    generate_image = generate
+
+
+@dataclass
+class CanvaImageAdapter:
+    """Generate a fresh image through Canva's asynchronous preview API."""
+
+    access_token: str
+    base_url: str = "https://api.canva.com/rest/v1"
+    session: Any | None = None
+
+    def generate(
+        self,
+        prompt: str,
+        aspect_ratio: str = "square",
+        *,
+        model: str | None = None,
+        idempotency_key: str | None = None,
+        poll_attempts: int = 60,
+        poll_interval_seconds: float = 1.0,
+    ) -> dict[str, Any]:
+        if not self.access_token:
+            raise ProviderError("Canva access token is required")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ProviderError("Canva image prompt is required")
+        if poll_attempts < 1:
+            raise ProviderError("Canva poll attempts must be positive")
+        s = _session(self.session)
+        headers = {"Authorization": f"Bearer {self.access_token}", "Content-Type": "application/json"}
+        root = self.base_url.rstrip("/")
+        payload: dict[str, Any] = {
+            "prompt": prompt.strip()[:5000],
+            "aspect_ratio": aspect_ratio,
+            "idempotency_key": idempotency_key or str(uuid.uuid4()),
+            "asset_upload": {"type": "upload", "asset_name": "Malay Tyres AI image"},
+        }
+        if model:
+            payload["model"] = model
+        try:
+            created = _check(s.post(f"{root}/image-generations", headers=headers, json=payload), "Canva image generation")
+            job = _job(created, "Canva image generation")
+            result = job if job.get("status") == "success" else _poll_job(
+                s, f"{root}/image-generations/{job['id']}", headers, "Canva image generation",
+                attempts=poll_attempts, interval_seconds=poll_interval_seconds,
+            )
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError("Canva image generation request failed") from exc
+        image = result.get("result", {}).get("image", {}) if isinstance(result.get("result"), dict) else {}
+        image_url = image.get("url") if isinstance(image, dict) else None
+        asset = image.get("asset", {}) if isinstance(image, dict) else {}
+        if not isinstance(image_url, str) or not image_url:
+            raise ProviderError("Canva image generation did not return an image URL")
+        return {
+            "provider": "canva",
+            "job_id": job["id"],
+            "image_url": image_url,
+            "asset_id": asset.get("id") if isinstance(asset, dict) else None,
+            "aspect_ratio": aspect_ratio,
+            "model": model,
+            "idempotency_key": payload["idempotency_key"],
+        }
+
+    generate_image = generate
+
+
+GeminiImageGenerator = GeminiImageAdapter
+CanvaImageGenerator = CanvaImageAdapter
+
+
 @dataclass
 class CanvaAdapter:
     access_token: str

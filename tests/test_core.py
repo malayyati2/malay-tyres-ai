@@ -8,6 +8,9 @@ from tyre_agents.core import (
     Review,
     generate_content,
     generate_reply,
+    regenerate_reply,
+    reply_variants,
+    select_salutation,
     publish_approved,
 )
 
@@ -16,6 +19,24 @@ def test_reply_variation_is_deterministic_and_varied():
     replies = {generate_reply(Review(f"r{i}", "Sam", 5, "Great")) for i in range(8)}
     assert len(replies) == 2
     assert generate_reply(Review("r1", "Sam", 5, "Great")) == generate_reply(Review("r1", "Sam", 5, "Great"))
+
+
+def test_replies_do_not_use_names_and_can_be_regenerated():
+    review = Review("review-name", "Alexandra", 5, "Excellent service")
+    assert select_salutation(review) == "Dear Customer"
+    first = generate_reply(review)
+    second = regenerate_reply(review, first, salutation="Dear Ma'am")
+    assert "Alexandra" not in first
+    assert "Alexandra" not in second
+    assert second.startswith("Dear Ma'am,")
+    assert second != first
+
+
+def test_only_explicit_salutations_are_accepted():
+    assert select_salutation("Dear Sir") == "Dear Sir"
+    assert select_salutation("female") == "Dear Customer"
+    assert generate_reply(Review("r-sir", "Taylor", 5, "Great", "Dear Sir")).startswith("Dear Sir,")
+    assert len(reply_variants(Review("r-variants", "Taylor", 3, "Okay"))) == 2
 
 
 def test_approval_gates_publishing():

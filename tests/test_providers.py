@@ -1,6 +1,7 @@
 import pytest
+from types import SimpleNamespace
 
-from tyre_agents.providers import CanvaAdapter, InstagramAdapter, ProviderError, WhatsAppAdapter
+from tyre_agents.providers import CanvaAdapter, GeminiImageAdapter, InstagramAdapter, ProviderError, WhatsAppAdapter
 
 
 class Response:
@@ -71,3 +72,25 @@ def test_canva_native_image_generation_saves_asset_and_polls_job():
     assert request["asset_upload"] == {"type": "upload", "asset_name": "Malay Tyres visual"}
     assert request["prompt"] == "Photorealistic Indian SUV and premium tyre shop"
     assert fake.calls[1][0] == "https://canva.test/rest/v1/image-generations/image-job-1"
+
+
+def test_gemini_image_generation_returns_previewable_bytes_without_network():
+    response = SimpleNamespace(
+        candidates=[SimpleNamespace(content=SimpleNamespace(parts=[
+            SimpleNamespace(inline_data=SimpleNamespace(data=b"png-bytes", mime_type="image/png"))
+        ]))]
+    )
+
+    class FakeModels:
+        def __init__(self): self.calls = []
+        def generate_content(self, **kwargs):
+            self.calls.append(kwargs)
+            return response
+
+    client = SimpleNamespace(models=FakeModels())
+    result = GeminiImageAdapter("secret", client=client).generate("A premium tyre service scene", "4:5")
+
+    assert result["image_bytes"] == b"png-bytes"
+    assert result["data_uri"].startswith("data:image/png;base64,")
+    assert client.models.calls[0]["model"] == "gemini-3.1-flash-image"
+    assert client.models.calls[0]["config"].response_modalities == ["IMAGE"]
