@@ -13,6 +13,9 @@ class FakeSession:
     def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
         return next(self.responses)
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return next(self.responses)
 
 
 def test_canva_upload_autofill_export_routes_and_returns_receipt():
@@ -44,3 +47,27 @@ def test_errors_are_safe_and_do_not_expose_token():
     with pytest.raises(ProviderError, match="HTTP 401") as error:
         InstagramAdapter("TOP-SECRET", "ig", session=fake).publish_image("url")
     assert "TOP-SECRET" not in str(error.value)
+
+
+def test_canva_native_image_generation_saves_asset_and_polls_job():
+    fake = FakeSession([
+        Response({"job": {"id": "image-job-1", "status": "in_progress"}}),
+        Response({"job": {"id": "image-job-1", "status": "success", "result": {
+            "image": {"asset": {"id": "canva-asset-1", "name": "Malay Tyres visual"}}
+        }}}),
+    ])
+    adapter = CanvaAdapter("secret-token", "template", base_url="https://canva.test/rest/v1", session=fake)
+
+    asset_id = adapter.generate_image_asset(
+        "Photorealistic Indian SUV and premium tyre shop",
+        name="Malay Tyres visual",
+        poll_attempts=2,
+        poll_interval_seconds=0,
+    )
+
+    assert asset_id == "canva-asset-1"
+    assert fake.calls[0][0] == "https://canva.test/rest/v1/image-generations"
+    request = fake.calls[0][1]["json"]
+    assert request["asset_upload"] == {"type": "upload", "asset_name": "Malay Tyres visual"}
+    assert request["prompt"] == "Photorealistic Indian SUV and premium tyre shop"
+    assert fake.calls[1][0] == "https://canva.test/rest/v1/image-generations/image-job-1"
