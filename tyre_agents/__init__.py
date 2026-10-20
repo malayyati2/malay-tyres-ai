@@ -18,19 +18,6 @@ from .core import (
 )
 from .canva_oauth import PkceRequest, create_pkce_request, exchange_code
 from .gemini_text import CampaignResult, GeminiTextGenerator
-from .providers import (
-    CanvaAdapter,
-    CanvaImageAdapter,
-    CanvaImageGenerator,
-    DEFAULT_GEMINI_IMAGE_MODEL,
-    DEFAULT_IMAGEN_MODEL,
-    GeneratedImage,
-    GeminiImageAdapter,
-    GeminiImageGenerator,
-    InstagramAdapter,
-    ProviderError,
-    WhatsAppAdapter,
-)
 
 __all__ = [
     "ApprovalQueue",
@@ -52,15 +39,4 @@ __all__ = [
     "exchange_code",
     "CampaignResult",
     "GeminiTextGenerator",
-    "CanvaAdapter",
-    "CanvaImageAdapter",
-    "CanvaImageGenerator",
-    "DEFAULT_GEMINI_IMAGE_MODEL",
-    "DEFAULT_IMAGEN_MODEL",
-    "GeneratedImage",
-    "GeminiImageAdapter",
-    "GeminiImageGenerator",
-    "InstagramAdapter",
-    "WhatsAppAdapter",
-    "ProviderError",
 ]

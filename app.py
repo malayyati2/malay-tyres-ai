@@ -16,20 +16,23 @@ from zoneinfo import ZoneInfo
 
 import streamlit as st
 
-from tyre_agents.core import (
-    ApprovalQueue,
-    ContentDraft,
-    Destination,
-    InMemoryPublisher,
-    SAMPLE_REVIEWS,
-    generate_content,
-    DEFAULT_SALUTATION,
-    SALUTATIONS,
-    generate_reply,
-    regenerate_reply,
-    select_salutation,
-    publish_approved,
-)
+from tyre_agents.core import ApprovalQueue, ContentDraft, Destination, InMemoryPublisher, SAMPLE_REVIEWS, generate_content, publish_approved
+try:
+    from tyre_agents.core import DEFAULT_SALUTATION, SALUTATIONS, regenerate_reply, select_salutation
+except ImportError:  # Keeps a running app compatible with older cached deployments during rollout.
+    DEFAULT_SALUTATION = "Dear Customer"
+    SALUTATIONS = ("Dear Sir", "Dear Ma'am", "Dear Customer")
+
+    def select_salutation(value=None):
+        requested = getattr(value, "salutation", value)
+        normalized = " ".join(str(requested or "").strip().split()).casefold()
+        return next((item for item in SALUTATIONS if item.casefold() == normalized), DEFAULT_SALUTATION)
+
+    def regenerate_reply(review, current_reply=None, *, salutation=None, **_kwargs):
+        greeting = select_salutation(salutation)
+        base = "Thank you for sharing your feedback. We appreciate the opportunity to serve you better."
+        alternate = "We appreciate your review and will continue working to provide excellent service."
+        return f"{greeting}, {alternate if current_reply and alternate not in current_reply else base}"
 from tyre_agents.canva_oauth import create_pkce_request, exchange_code
 from tyre_agents.providers import (
     CanvaAdapter,
