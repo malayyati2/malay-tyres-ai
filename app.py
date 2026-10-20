@@ -436,7 +436,7 @@ def gemini_api_key() -> str:
 
 
 def gemini_image_model() -> str:
-    return secret("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+    return secret("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image")
 
 
 def canva_image_model() -> str:
