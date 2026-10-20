@@ -665,6 +665,124 @@ def image_generation_config_status() -> tuple[str, str]:
     return ("fail", "Missing Streamlit Secrets: " + ", ".join(missing) + ". No image-generation request was made.")
 
 
+def run_all_api_diagnostics() -> dict[str, tuple[str, str]]:
+    """Perform one-click, read-only checks for configured live integrations."""
+    results: dict[str, tuple[str, str]] = {}
+
+    # Google Business Profile: a read-only account-list call validates the OAuth token and API access.
+    if not google_connected():
+        results["Google Business Profile"] = ("fail", "No saved Google OAuth token. Connect the account that manages Malay Tyres.")
+    else:
+        try:
+            payload = google_api_request("GET", f"{GOOGLE_ACCOUNT_API}/accounts", params={"pageSize": 1})
+            accounts = payload.get("accounts", [])
+            results["Google Business Profile"] = (
+                "pass" if accounts else "warn",
+                "Google accepted the token and returned an account." if accounts else
+                "Google accepted the request but returned no accounts. Check which Google account was authorized."
+            )
+        except Exception as exc:
+            results["Google Business Profile"] = ("fail", f"Read-only API check failed: {str(exc)[:220]}")
+
+    # Gemini: one tiny, low-token request distinguishes a working key from quota/API errors.
+    api_key = gemini_api_key()
+    if not api_key:
+        results["Gemini campaign copy"] = ("fail", "GEMINI_API_KEY is missing from Streamlit Secrets.")
+    else:
+        try:
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model()}:generateContent",
+                params={"key": api_key},
+                json={
+                    "contents": [{"parts": [{"text": "Reply with exactly OK."}]}],
+                    "generationConfig": {"temperature": 0, "maxOutputTokens": 5},
+                },
+                timeout=20,
+            )
+            if response.ok:
+                results["Gemini campaign copy"] = ("pass", "Gemini accepted a small test request.")
+            elif response.status_code == 429:
+                results["Gemini campaign copy"] = ("fail", "Gemini is reachable, but the API quota/rate limit is exhausted (HTTP 429).")
+            elif response.status_code in (401, 403):
+                results["Gemini campaign copy"] = ("fail", f"Gemini rejected the key or API permission (HTTP {response.status_code}).")
+            else:
+                results["Gemini campaign copy"] = ("fail", f"Gemini test request failed (HTTP {response.status_code}).")
+        except requests.RequestException as exc:
+            results["Gemini campaign copy"] = ("fail", f"Gemini could not be reached ({type(exc).__name__}).")
+
+    # Canva: validate token, template access, and the configured autofill fields.
+    try:
+        results.update(canva_diagnostics())
+    except Exception as exc:
+        results["Canva"] = ("fail", f"Canva check could not complete ({type(exc).__name__}).")
+
+    # Instagram: verify token acceptance without creating or publishing a post.
+    instagram_token = secret("INSTAGRAM_ACCESS_TOKEN")
+    instagram_account = secret("INSTAGRAM_BUSINESS_ACCOUNT_ID")
+    if not instagram_token or not instagram_account:
+        results["Instagram publishing"] = ("fail", "INSTAGRAM_ACCESS_TOKEN or INSTAGRAM_BUSINESS_ACCOUNT_ID is missing.")
+    else:
+        try:
+            version = secret("META_GRAPH_API_VERSION", "v21.0")
+            response = requests.get(
+                f"https://graph.facebook.com/{version}/me",
+                params={"fields": "id", "access_token": instagram_token},
+                timeout=20,
+            )
+            if response.ok:
+                results["Instagram publishing"] = ("pass", "Meta accepted the access token. No post was created.")
+            else:
+                results["Instagram publishing"] = ("fail", f"Meta rejected the token or permission (HTTP {response.status_code}).")
+        except requests.RequestException as exc:
+            results["Instagram publishing"] = ("fail", f"Meta could not be reached ({type(exc).__name__}).")
+
+    # WhatsApp: read phone-number metadata only; this does not send a message or alter registration.
+    wa_token = secret("WHATSAPP_ACCESS_TOKEN")
+    wa_phone_id = secret("WHATSAPP_PHONE_NUMBER_ID")
+    if not wa_token or not wa_phone_id:
+        results["WhatsApp Cloud API"] = ("fail", "WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID is missing.")
+    else:
+        try:
+            version = secret("META_GRAPH_API_VERSION", "v21.0")
+            response = requests.get(
+                f"https://graph.facebook.com/{version}/{wa_phone_id}",
+                headers={"Authorization": f"Bearer {wa_token}"},
+                params={"fields": "display_phone_number,verified_name"},
+                timeout=20,
+            )
+            if response.ok:
+                results["WhatsApp Cloud API"] = ("pass", "Meta accepted the token and phone-number ID. No message was sent.")
+            else:
+                results["WhatsApp Cloud API"] = ("fail", f"Meta rejected the token, phone-number ID, or permission (HTTP {response.status_code}).")
+        except requests.RequestException as exc:
+            results["WhatsApp Cloud API"] = ("fail", f"Meta could not be reached ({type(exc).__name__}).")
+
+    image_status, image_message = image_generation_config_status()
+    results["Cloudflare image generation"] = (
+        ("warn", image_message + " This check does not spend image-generation credits.")
+        if image_status == "pass"
+        else ("fail", image_message)
+    )
+
+    if secret("SUPABASE_URL") and secret("SUPABASE_SERVICE_ROLE_KEY"):
+        results["Persistent OAuth storage"] = ("pass", "Supabase storage settings are present; the check does not read or display stored tokens.")
+    else:
+        results["Persistent OAuth storage"] = (
+            "warn",
+            "Supabase storage is not configured. OAuth tokens may rely on /tmp SQLite and can be lost when the app restarts."
+        )
+
+    results["Google Business Profile posts"] = (
+        "warn",
+        "Publishing new Google Business Profile posts is not implemented in this codebase; review sync/replies are separate."
+    )
+    results["WhatsApp Business App coexistence"] = (
+        "warn",
+        "Embedded Signup/coexistence is not implemented in this app yet. The Cloud API check above does not migrate or alter your existing WhatsApp number."
+    )
+    return results
+
+
 def canva_ready() -> bool:
     return bool(canva_access_token() and secret("CANVA_BRAND_TEMPLATE_ID"))
 
@@ -1297,12 +1415,9 @@ def render_connections() -> None:
             st.info("Add CANVA_CLIENT_ID, CANVA_CLIENT_SECRET and CANVA_REDIRECT_URI to Streamlit secrets, then this button will appear.", icon=":material/key:")
         if st.session_state.canva_oauth_error:
             st.error(st.session_state.canva_oauth_error, icon=":material/error:")
-        if st.button("Run safe Canva + image configuration check", key="canva_safe_diagnostics", icon=":material/health_and_safety:", width="stretch"):
-            with st.spinner("Checking Canva authorization and template configuration..."):
-                checks = canva_diagnostics()
-                image_status, image_message = image_generation_config_status()
-                checks["Image-generation configuration"] = (image_status, image_message)
-                st.session_state["canva_diagnostic_results"] = checks
+        if st.button("Run all live API checks", key="canva_safe_diagnostics", icon=":material/health_and_safety:", width="stretch"):
+            with st.spinner("Checking Google, Gemini, Canva, Meta and image-generation configuration..."):
+                st.session_state["canva_diagnostic_results"] = run_all_api_diagnostics()
         checks = st.session_state.get("canva_diagnostic_results")
         if checks:
             st.markdown("**Diagnostic results**")
