@@ -403,27 +403,11 @@ def gemini_api_key() -> str:
 
 
 def gemini_model() -> str:
-    """Use the configured Gemini model, replacing the retired default."""
+    """Use the currently recommended model and transparently replace the retired default."""
     configured = secret("GEMINI_MODEL", "gemini-3.8-flash").strip()
     if not configured or configured == "gemini-2.5-flash":
         return "gemini-3.8-flash"
     return configured
-
-
-def gemini_quota_message(error: Exception) -> str | None:
-    """Return a clear explanation for quota errors, without exposing raw API details."""
-    message = str(error).casefold()
-    if "429" in message or "resource_exhausted" in message or "quota exceeded" in message:
-        if "perday" in message or "per_day" in message or "per day" in message or "retrydelay" in message or "retry in 14h" in message:
-            return (
-                "Gemini's daily free-tier request limit is exhausted. The app has used its offline fallback; "
-                "try again after the quota reset or configure an eligible alternative model."
-            )
-        return (
-            "Gemini's request quota/rate limit has been reached. The app has used its offline fallback; "
-            "wait for the limit to reset before trying again."
-        )
-    return None
 
 
 def generate_review_reply(review) -> str:
@@ -582,7 +566,7 @@ def canva_authorization_url() -> str | None:
 
 
 def canva_ready() -> bool:
-    return bool(canva_access_token() and secret("CANVA_BRAND_TEMPLATE_ID", "EAHYWp9V4fg"))
+    return bool(canva_access_token() and secret("CANVA_BRAND_TEMPLATE_ID"))
 
 
 def instagram_ready() -> bool:
@@ -597,23 +581,67 @@ def whatsapp_ready() -> bool:
     )
 
 
+def generate_fresh_campaign_image(prompt: str) -> bytes:
+    """Generate a unique square automotive image with Gemini, for insertion into Canva."""
+    api_key = gemini_api_key()
+    if not api_key:
+        raise ProviderError("Add GEMINI_API_KEY to enable fresh AI image generation")
+    model = secret("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image").strip() or "gemini-2.5-flash-image"
+    variation = random_secrets.token_hex(4)
+    image_prompt = (
+        "Generate ONE photorealistic square 1:1 premium automotive advertising photograph for an Indian tyre and car-care shop. "
+        "Show a believable Indian-market car/SUV or a tyre/wheel/workshop scene. Use a new composition, camera angle, subject, "
+        "location and lighting; do not use a fixed stock composition. Premium modern 3D-commercial realism, crisp tyre tread and alloy-wheel detail, "
+        "balanced light background with restrained yellow/charcoal accents. No text, no letters, no logos, no watermark, no fake brand badges. "
+        "Keep the centre composition clean and leave safe space for Canva overlay text. Make this result visually distinct from earlier generations.\n"
+        f"Campaign-specific creative direction: {prompt}\nVariation key: {variation}"
+    )
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    try:
+        response = requests.post(endpoint, params={"key": api_key}, json={
+            "contents": [{"parts": [{"text": image_prompt}]}],
+            "generationConfig": {"responseModalities": ["IMAGE"]},
+        }, timeout=120)
+        if not response.ok:
+            detail = ""
+            try:
+                detail = str(response.json().get("error", {}).get("message", ""))
+            except Exception:
+                pass
+            detail = detail.replace(api_key, "[hidden API key]")
+            raise ProviderError(f"AI image generation failed (HTTP {response.status_code})" + (f": {detail[:280]}" if detail else ""))
+        payload = response.json()
+        for candidate in payload.get("candidates", []):
+            for part in candidate.get("content", {}).get("parts", []):
+                inline = part.get("inlineData") or part.get("inline_data")
+                if inline and inline.get("data"):
+                    return base64.b64decode(inline["data"])
+        raise ProviderError("AI image model returned text but no image. Check the selected image model and quota.")
+    except requests.RequestException as exc:
+        raise ProviderError(f"AI image generation request failed: {type(exc).__name__}") from exc
+
+
 def generate_canva_design(draft: ContentDraft) -> dict:
     field_title = secret("CANVA_TITLE_FIELD", "TITLE")
     field_body = secret("CANVA_BODY_FIELD", "BODY")
     field_cta = secret("CANVA_CTA_FIELD", "CTA")
+    field_image = secret("CANVA_IMAGE_FIELD", "IMAGE")
     adapter = CanvaAdapter(
         access_token=canva_access_token(),
-        brand_template_id=secret("CANVA_BRAND_TEMPLATE_ID", "EAHYWp9V4fg"),
+        brand_template_id=secret("CANVA_BRAND_TEMPLATE_ID"),
     )
+    with st.spinner("Generating a fresh campaign image..."):
+        image_bytes = generate_fresh_campaign_image(draft.image_prompt)
+    asset_id = adapter.upload_image_asset(image_bytes, name=f"Malay Tyres {draft.title[:30]} visual")
     return adapter.autofill_export(
         {
             field_title: draft.title,
             field_body: draft.body,
             field_cta: secret("CANVA_CTA_TEXT", "Book your tyre check today"),
         },
+        image_fields={field_image: asset_id},
         title=draft.title,
     )
-
 
 def generate_campaign_draft(topic: str, tone: str, draft_id: str, destinations: tuple[Destination, ...]) -> tuple[ContentDraft, str]:
     """Prefer Gemini for copy, with a deterministic fallback for offline trials."""
@@ -623,8 +651,8 @@ def generate_campaign_draft(topic: str, tone: str, draft_id: str, destinations: 
         os.environ["GEMINI_MODEL"] = gemini_model()
         generator = GeminiTextGenerator(gemini_api_key(), model=gemini_model())
         prompt = f"{topic.strip()} (tone: {tone})"
-        # Retry only transient server-capacity errors. Do not retry 429 quota errors:
-        # repeated requests cannot fix exhausted quota and may consume more requests.
+        # Retry only transient server-capacity errors. A 429 quota response can
+        # represent a daily project/model cap; retrying it wastes requests and time.
         campaign = None
         last_error = None
         for attempt in range(3):
@@ -634,8 +662,11 @@ def generate_campaign_draft(topic: str, tone: str, draft_id: str, destinations: 
             except Exception as exc:
                 last_error = exc
                 message = f"{type(exc).__name__}: {exc}".casefold()
-                # RESOURCE_EXHAUSTED / 429 is a quota response, not a transient server error.
-                if "429" in message or "resource_exhausted" in message or "quota exceeded" in message:
+                quota_exhausted = any(marker in message for marker in (
+                    "429", "resource_exhausted", "generate_requests_per_day",
+                    "free_tier_requests", "quota exceeded",
+                ))
+                if quota_exhausted:
                     raise
                 temporary = any(marker in message for marker in (
                     "503", "unavailable", "high demand", "500", "502", "504",
@@ -792,7 +823,7 @@ def render_metric_row() -> None:
     cols[1].metric("Content awaiting approval", str(pending_draft), "Human gate")
     cols[2].metric("Published this session", str(published), "Demo receipts")
     ready = int(gemini_api_key() != "") + int(canva_ready()) + int(instagram_ready()) + int(whatsapp_ready())
-    cols[3].metric("Connections ready", f"{ready}/4", "Gemini + Canva + Meta")
+    cols[3].metric("Connections ready", f"{ready}/4", "AI images + Canva + Meta")
 
 
 def render_overview() -> None:
@@ -910,18 +941,18 @@ def render_draft_preview(draft: ContentDraft) -> None:
         st.code(draft.image_prompt, language="text")
         st.markdown("**Publish to**")
         st.write(" · ".join(DESTINATION_LABELS[destination] for destination in draft.destinations) or "No channel selected")
-        st.caption("The design brief is retained as an audit trail. Canva creates the branded visual automatically from your configured brand template.")
+        st.caption("The design brief is retained as an audit trail. A new image is generated for each request, uploaded to Canva, then inserted into the IMAGE field while TITLE, BODY and CTA are filled.")
 
 
 def render_generated_design(draft: ContentDraft) -> None:
     with st.container(border=True):
-        st.subheader("Canva-generated visual")
+        st.subheader("Fresh AI image + Canva design")
         generated_design = st.session_state.generated_design
         if generated_design is not None:
             st.image(
                 generated_design["image_url"],
-                caption="Generated automatically from your Canva brand template",
-                alt="Canva-generated Malay Tyres social media creative",
+                caption="A fresh AI-generated image inserted into your Canva Brand Template",
+                alt="Malay Tyres social media creative with a newly generated AI image",
                 width="stretch",
             )
             if generated_design.get("design_url"):
@@ -929,9 +960,9 @@ def render_generated_design(draft: ContentDraft) -> None:
             st.caption("Canva export URLs expire after 24 hours. Publish approved content during this trial window.")
         elif st.session_state.design_error:
             st.warning(st.session_state.design_error, icon=":material/warning:")
-            st.caption("Add CANVA_ACCESS_TOKEN to Streamlit secrets. The verified Malay Tyres template is used by default; set CANVA_BRAND_TEMPLATE_ID only if you want a different template.")
+            st.caption("Check GEMINI_API_KEY, Canva OAuth scopes (asset:write and asset:read), and the template IMAGE field. Do not share tokens in chat.")
         else:
-            st.info("Canva will generate the branded visual when you submit a brief.", icon=":material/image:")
+            st.info("The agent will generate a new image and insert it into Canva when you submit a brief.", icon=":material/image:")
 
 
 def render_content_studio() -> None:
@@ -971,18 +1002,31 @@ def render_content_studio() -> None:
                 )
                 copy_provider = "offline fallback"
             except Exception as exc:
-                quota_message = gemini_quota_message(exc)
-                if quota_message:
-                    st.warning(quota_message, icon=":material/warning:")
-                else:
-                    error_message = str(exc) or "No error details returned."
-                    api_key = gemini_api_key()
-                    if api_key:
-                        error_message = error_message.replace(api_key, "[hidden API key]")
-                    st.warning(
-                        f"Gemini failed ({type(exc).__name__}): {error_message}. Using the offline fallback.",
-                        icon=":material/warning:",
+                raw_error = str(exc) or "No error details returned."
+                normalized_error = raw_error.casefold()
+                if any(marker in normalized_error for marker in (
+                    "generate_requests_per_day", "free_tier_requests", "retrydelay",
+                )) or ("429" in normalized_error and "quota" in normalized_error):
+                    error_message = (
+                        "Gemini's free-tier daily quota is exhausted for the configured model. "
+                        "No further Gemini retries will be made for this request. The app is using "
+                        "its offline fallback; try Gemini again after the quota reset, or review "
+                        "your usage and billing limits in Google AI Studio."
                     )
+                elif "429" in normalized_error or "resource_exhausted" in normalized_error:
+                    error_message = (
+                        "Gemini returned a quota/rate-limit response. The app is using its offline "
+                        "fallback instead of retrying and consuming more quota."
+                    )
+                else:
+                    error_message = raw_error
+                api_key = gemini_api_key()
+                if api_key:
+                    error_message = error_message.replace(api_key, "[hidden API key]")
+                st.warning(
+                    f"Gemini failed ({type(exc).__name__}): {error_message}. Using the offline fallback.",
+                    icon=":material/warning:",
+                )
                 fallback = generate_content(topic, draft_id=draft_id)
                 draft = ContentDraft(
                     draft_id=fallback.draft_id,
@@ -1007,7 +1051,7 @@ def render_content_studio() -> None:
                     st.session_state.design_error = str(exc)
                     st.warning("The copy was created, but Canva did not return a design.", icon=":material/warning:")
             else:
-                st.session_state.design_error = "Canva is not configured yet. Add CANVA_ACCESS_TOKEN to Streamlit secrets to create the design automatically."
+                st.session_state.design_error = "Canva is not configured yet. Add CANVA_ACCESS_TOKEN and CANVA_BRAND_TEMPLATE_ID to create the design automatically."
                 st.warning("The copy was created. Connect Canva to generate the visual automatically.", icon=":material/warning:")
 
     draft = st.session_state.draft
@@ -1059,10 +1103,10 @@ def render_content_studio() -> None:
 def render_connections() -> None:
     st.header("Connections and guardrails")
     st.write("Configure Canva, Instagram and WhatsApp once in Streamlit secrets. The content studio then creates the Canva visual and publishes only after approval.")
-    st.warning("Canva's public REST API does not expose Magic Media text-to-image generation. This app uses Canva's supported brand-template autofill/export flow, so your Canva brand template should already contain the visual treatment/background.", icon=":material/info:")
+    st.info("Canva’s public REST API does not expose Magic Media text-to-image generation. This agent generates a fresh image with Gemini, uploads it to your Canva media library, and fills the Canva template’s IMAGE field. Canva still handles template layout and export.", icon=":material/info:")
     descriptions = {
         "Google Business Profile": "Read new reviews and publish approved replies through Google OAuth.",
-        "Gemini": "Generate the campaign copy and image prompt. Gemini image generation is not used.",
+        "Gemini image generation": "Creates a fresh image for each campaign; the image is uploaded to Canva automatically.",
         "Canva": "Create and export the branded visual from a Canva brand template.",
         "Instagram": "Publish approved feed posts and stories through the Instagram Graph API.",
         "WhatsApp": "Send approved image messages through the WhatsApp Cloud API.",
@@ -1071,7 +1115,7 @@ def render_connections() -> None:
         with st.container(border=True):
             key_ready = {
                 "Google Business Profile": google_connected(),
-                "Gemini": bool(gemini_api_key()),
+                "Gemini image generation": bool(gemini_api_key()),
                 "Canva": canva_ready(),
                 "Instagram": instagram_ready(),
                 "WhatsApp": whatsapp_ready(),
