@@ -37,6 +37,7 @@ CANVA_BRAND_TEMPLATE_ID = "your-canva-brand-template-id"
 CANVA_TITLE_FIELD = "TITLE"
 CANVA_BODY_FIELD = "BODY"
 CANVA_CTA_FIELD = "CTA"
+CANVA_IMAGE_FIELD = "IMAGE"
 CANVA_CTA_TEXT = "Book your tyre check today"
 
 INSTAGRAM_ACCESS_TOKEN = "your-meta-access-token"
