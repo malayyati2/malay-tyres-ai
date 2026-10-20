@@ -1346,7 +1346,7 @@ def render_content_studio() -> None:
 def render_connections() -> None:
     st.header("Connections and guardrails")
     st.write("Configure Canva, Instagram and WhatsApp once in Streamlit secrets. The content studio then creates the Canva visual and publishes only after approval.")
-    st.info("This app uses Canva Connect OAuth for template autofill/export and Cloudflare Workers AI (FLUX) to generate a fresh image, which is uploaded to Canva. The diagnostic below checks credentials and template fields without displaying secrets or generating an image.", icon=":material/info:")
+    st.info("This app uses Canva Connect OAuth for template autofill/export and Cloudflare Workers AI (FLUX) for fresh images. The one-click diagnostic makes read-only checks for Google, Canva, Instagram and WhatsApp, sends one tiny Gemini test request, and checks Cloudflare credential presence without generating an image, publishing a post, or sending a message. Secrets are never displayed.", icon=":material/info:")
     descriptions = {
         "Google Business Profile": "Read new reviews and publish approved replies through Google OAuth.",
         "Cloudflare image generation": "Creates a fresh image for each campaign; the image is uploaded to Canva automatically.",
