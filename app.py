@@ -587,59 +587,63 @@ def openai_image_api_key() -> str:
 
 
 def generate_fresh_campaign_image(prompt: str) -> bytes:
-    """Generate a fresh automotive image using OpenAI Images API for insertion into Canva."""
-    api_key = openai_image_api_key()
-    if not api_key:
-        raise ProviderError("Add OPENAI_API_KEY to Streamlit Secrets to enable OpenAI image generation")
-    model = secret("OPENAI_IMAGE_MODEL", "gpt-image-2.5-flare").strip() or "gpt-image-2.5-flare"
-    quality = secret("OPENAI_IMAGE_QUALITY", "low").strip().lower() or "low"
-    # Keep output cost-conscious by default. Use a unique creative variation on every request.
-    variation = random_secrets.token_hex(4)
+    """Generate a fresh campaign image through low-cost Cloudflare Workers AI."""
+    account_id = secret("CLOUDFLARE_ACCOUNT_ID").strip()
+    api_token = secret("CLOUDFLARE_API_TOKEN").strip()
+    if not account_id or not api_token:
+        raise ProviderError(
+            "Cloudflare image generation is selected, but CLOUDFLARE_ACCOUNT_ID and "
+            "CLOUDFLARE_API_TOKEN are not configured in Streamlit Secrets. "
+            "Add these two values from Cloudflare Workers AI; OpenAI is not called, so no OpenAI credits are spent."
+        )
+
+    variation = random_secrets.randbelow(2_000_000_000) + 1
     image_prompt = (
         "Create ONE photorealistic square 1:1 premium automotive advertising photograph for an Indian tyre and car-care shop. "
         "Show a believable Indian-market car/SUV or a tyre/wheel/workshop scene. Use a new composition, camera angle, subject, "
         "location and lighting; avoid a generic stock-photo look. Premium modern 3D-commercial realism, crisp tyre tread and alloy-wheel detail, "
         "balanced light background with restrained yellow/charcoal accents. No text, no letters, no logos, no watermark, no fake brand badges. "
-        "Keep the centre composition clean and leave safe space for Canva overlay text. Make this result visually distinct from earlier generations.\n"
-        f"Campaign-specific creative direction: {prompt}\nVariation key: {variation}"
+        "Keep the centre composition clean and leave safe space for Canva overlay text.\n"
+        f"Campaign-specific creative direction: {prompt}\nVariation seed: {variation}"
+    )[:2048]
+    endpoint = (
+        "https://api.cloudflare.com/client/v4/accounts/"
+        f"{account_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
     )
-    endpoint = "https://api.openai.com/v1/images/generations"
     try:
         response = requests.post(
             endpoint,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "prompt": image_prompt,
-                "size": "1024x1024",
-                "quality": quality,
-                "output_format": "png",
-                "n": 1,
-            },
+            headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"},
+            json={"prompt": image_prompt, "steps": 4, "seed": variation},
             timeout=180,
         )
         if not response.ok:
             detail = ""
             try:
                 payload = response.json()
-                error = payload.get("error", {}) if isinstance(payload, dict) else {}
-                detail = str(error.get("message") or error.get("code") or "")
+                errors = payload.get("errors", []) if isinstance(payload, dict) else []
+                result = payload.get("result", {}) if isinstance(payload, dict) else {}
+                detail = "; ".join(
+                    str(item.get("message") or item.get("code") or item)
+                    for item in errors[:2]
+                ) or str(result.get("message") or "")
             except Exception:
                 pass
-            # Never include the credential in an error message or log.
-            detail = detail.replace(api_key, "[hidden API key]")
+            detail = detail.replace(api_token, "[hidden API token]")
             raise ProviderError(
-                f"OpenAI image generation failed (HTTP {response.status_code})"
+                f"Cloudflare FLUX image generation failed (HTTP {response.status_code})"
                 + (f": {detail[:350]}" if detail else "")
             )
         payload = response.json()
-        data = payload.get("data", [])
-        if data and data[0].get("b64_json"):
-            return base64.b64decode(data[0]["b64_json"])
-        raise ProviderError("OpenAI image API returned no image data. Check model access and API billing.")
+        image_b64 = (payload.get("result") or {}).get("image") if isinstance(payload, dict) else None
+        if image_b64:
+            try:
+                return base64.b64decode(image_b64, validate=True)
+            except Exception as exc:
+                raise ProviderError("Cloudflare returned image data that could not be decoded.") from exc
+        raise ProviderError("Cloudflare returned no image data. Check Workers AI access and account limits.")
     except requests.RequestException as exc:
-        raise ProviderError(f"OpenAI image generation request failed: {type(exc).__name__}") from exc
-
+        raise ProviderError(f"Cloudflare image generation request failed: {type(exc).__name__}") from exc
 
 def generate_canva_design(draft: ContentDraft) -> dict:
     field_title = secret("CANVA_TITLE_FIELD", "TITLE")
@@ -980,7 +984,7 @@ def render_generated_design(draft: ContentDraft) -> None:
             st.caption("Canva export URLs expire after 24 hours. Publish approved content during this trial window.")
         elif st.session_state.design_error:
             st.warning(st.session_state.design_error, icon=":material/warning:")
-            st.caption("Image generation uses OPENAI_API_KEY. Check OpenAI API billing/model access, then Canva OAuth scopes (asset:write and asset:read) and the template IMAGE field. Do not share keys or tokens in chat.")
+            st.caption("Image generation uses Cloudflare Workers AI FLUX.1 schnell. Check CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, Workers AI limits, Canva OAuth scopes (asset:write and asset:read), and the template IMAGE field. Do not share keys or tokens in chat.")
         else:
             st.info("The agent will generate a new image and insert it into Canva when you submit a brief.", icon=":material/image:")
 
