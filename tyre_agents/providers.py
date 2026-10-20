@@ -7,6 +7,8 @@ network I/O.
 from __future__ import annotations
 
 import time
+import base64
+import json
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -90,22 +92,49 @@ class CanvaAdapter:
     base_url: str = "https://api.canva.com/rest/v1"
     session: Any | None = None
 
+    def upload_image_asset(self, image_bytes: bytes, *, name: str = "Malay Tyres AI visual",
+                           poll_attempts: int = 60, poll_interval_seconds: float = 1.0) -> str:
+        """Upload a freshly generated PNG to Canva and return its asset ID.
+
+        Requires Canva OAuth scopes asset:write and asset:read.
+        """
+        if not self.access_token:
+            raise ProviderError("Canva access token is required to upload the generated image")
+        if not image_bytes:
+            raise ProviderError("Image generation returned an empty image")
+        s = _session(self.session)
+        root = self.base_url.rstrip("/")
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/octet-stream",
+            "Asset-Upload-Metadata": json.dumps({"name_base64": base64.b64encode(name[:50].encode("utf-8")).decode("ascii")}),
+        }
+        payload = _check(s.post(f"{root}/asset-uploads", headers=headers, data=image_bytes), "Canva image upload")
+        job = _job(payload, "Canva image upload")
+        result = job if job.get("status") == "success" else _poll_job(
+            s, f"{root}/asset-uploads/{job['id']}",
+            {"Authorization": f"Bearer {self.access_token}"}, "Canva image upload",
+            attempts=poll_attempts, interval_seconds=poll_interval_seconds,
+        )
+        asset = result.get("asset") or result.get("result", {}).get("asset") or {}
+        asset_id = asset.get("id") if isinstance(asset, dict) else None
+        if not asset_id:
+            raise ProviderError("Canva image upload completed but did not return an asset ID")
+        return str(asset_id)
+
     def autofill_export(self, text_fields: Mapping[str, str], *, title: str = "Malay Tyres campaign",
+                        image_fields: Mapping[str, str] | None = None,
                         export_format: str = "png", poll_attempts: int = 60,
                         poll_interval_seconds: float = 1.0) -> dict[str, Any]:
-        """Autofill a pre-built Canva brand template and return its export URL.
-
-        Canva's public REST API supports template autofill and export. It does
-        not expose Canva Magic Media text-to-image generation as a REST call,
-        so this flow assumes the brand template already contains the visual
-        treatment/background and the app fills its text fields automatically.
-        """
+        """Autofill text and optional uploaded image assets into a Canva Brand Template."""
         if not self.access_token or not self.brand_template_id:
             raise ProviderError("Canva access token and brand template ID are required")
         s = _session(self.session)
         headers = {"Authorization": f"Bearer {self.access_token}"}
         root = self.base_url.rstrip("/")
         field_data = {key: {"type": "text", "text": value} for key, value in text_fields.items()}
+        for key, asset_id in (image_fields or {}).items():
+            field_data[key] = {"type": "image", "asset_id": asset_id}
         fill = _check(
             s.post(
                 f"{root}/autofills",
