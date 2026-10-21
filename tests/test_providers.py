@@ -1,7 +1,15 @@
 import pytest
 from types import SimpleNamespace
 
-from tyre_agents.providers import CanvaAdapter, GeminiImageAdapter, InstagramAdapter, ProviderError, WhatsAppAdapter
+from tyre_agents.providers import (
+    CANVA_TEXT_LIMITS,
+    CanvaAdapter,
+    GeminiImageAdapter,
+    InstagramAdapter,
+    ProviderError,
+    WhatsAppAdapter,
+    build_canva_text_fields,
+)
 
 
 class Response:
@@ -94,3 +102,16 @@ def test_gemini_image_generation_returns_previewable_bytes_without_network():
     assert result["data_uri"].startswith("data:image/png;base64,")
     assert client.models.calls[0]["model"] == "gemini-3.1-flash-image"
     assert client.models.calls[0]["config"].response_modalities == ["IMAGE"]
+
+
+def test_canva_overlay_copy_is_limited_to_template_safe_lengths():
+    fields = build_canva_text_fields(
+        "A very long Malay Tyres headline that must fit on the image",
+        "A very long supporting message about safe journeys and professional tyre care that must be shortened for the Canva design overlay.",
+        "Book your tyre inspection today",
+    )
+
+    assert len(fields["TITLE"]) <= CANVA_TEXT_LIMITS["TITLE"]
+    assert len(fields["BODY"]) <= CANVA_TEXT_LIMITS["BODY"]
+    assert len(fields["CTA"]) <= CANVA_TEXT_LIMITS["CTA"]
+    assert not fields["TITLE"].endswith(" ")

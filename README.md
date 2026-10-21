@@ -53,6 +53,8 @@ META_GRAPH_API_VERSION = "v21.0"
 
 The Canva template must be a published Brand Template with autofill fields matching the configured field names, including `IMAGE` when you want the generated image inserted into the branded design. Canva AI image generation is a preview API, consumes Canva AI credits, requires the `asset:write` scope, and returns a temporary image/export URL.
 
+The Canva overlay text is automatically shortened before autofill so it stays within the template-safe limits: `TITLE` is 45 characters or fewer, `BODY` is 140 characters or fewer, and `CTA` is 20 characters or fewer. The full caption remains available for social publishing; only the text rendered on the image is shortened.
+
 Gemini is used for both campaign copy and image generation. Canva creates an independent second image, and both options are shown for comparison. Create a Gemini API key at https://aistudio.google.com/app/apikey and add it as `GEMINI_API_KEY`. If Gemini is unavailable, the app keeps the deterministic caption fallback and reports the image-provider error instead of claiming an image was created.
 
 The Connections page includes **Authorize Canva** when `CANVA_CLIENT_ID`, `CANVA_CLIENT_SECRET` and `CANVA_REDIRECT_URI` are configured. Add the exact same redirect URI in the Canva Developer Portal. After authorization, the app exchanges the OAuth code server-side using PKCE. For durable token persistence on Streamlit Cloud, configure the app's Supabase URL and service-role key; otherwise its SQLite fallback lives under `/tmp` and can be lost on restart. Never put secrets in GitHub or chat.

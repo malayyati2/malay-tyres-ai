@@ -36,10 +36,12 @@ except ImportError:  # Keeps a running app compatible with older cached deployme
 from tyre_agents.canva_oauth import create_pkce_request, exchange_code
 from tyre_agents.providers import (
     CanvaAdapter,
+    CANVA_TEXT_LIMITS,
     GeminiImageAdapter,
     InstagramAdapter,
     ProviderError,
     WhatsAppAdapter,
+    build_canva_text_fields,
 )
 from tyre_agents.gemini_text import GeminiTextGenerator
 
@@ -910,11 +912,14 @@ def generate_fresh_campaign_image(prompt: str) -> bytes:
         raise ProviderError(f"Cloudflare image generation request failed: {type(exc).__name__}") from exc
 
 def _canva_text_fields(draft: ContentDraft) -> dict[str, str]:
-    return {
-        secret("CANVA_TITLE_FIELD", "TITLE"): draft.title,
-        secret("CANVA_BODY_FIELD", "BODY"): draft.body,
-        secret("CANVA_CTA_FIELD", "CTA"): secret("CANVA_CTA_TEXT", "Book your tyre check today"),
-    }
+    return build_canva_text_fields(
+        draft.title,
+        draft.body,
+        secret("CANVA_CTA_TEXT", "Book your tyre check today"),
+        title_field=secret("CANVA_TITLE_FIELD", "TITLE"),
+        body_field=secret("CANVA_BODY_FIELD", "BODY"),
+        cta_field=secret("CANVA_CTA_FIELD", "CTA"),
+    )
 
 
 def _canva_adapter() -> CanvaAdapter:
@@ -1324,6 +1329,14 @@ def render_draft_preview(draft: ContentDraft) -> None:
         st.code(draft.image_prompt, language="text")
         st.markdown("**Publish to**")
         st.write(" · ".join(DESTINATION_LABELS[destination] for destination in draft.destinations) or "No channel selected")
+        canva_fields = _canva_text_fields(draft)
+        st.markdown("**Canva overlay copy**")
+        st.caption(
+            f"TITLE ≤ {CANVA_TEXT_LIMITS['TITLE']} characters · "
+            f"BODY ≤ {CANVA_TEXT_LIMITS['BODY']} · CTA ≤ {CANVA_TEXT_LIMITS['CTA']}"
+        )
+        for field_name, value in canva_fields.items():
+            st.write(f"**{field_name}** ({len(value)} characters): {value}")
         st.caption("The design brief is retained as an audit trail. A new image is generated for each request, uploaded to Canva, then inserted into the IMAGE field while TITLE, BODY and CTA are filled.")
 
 

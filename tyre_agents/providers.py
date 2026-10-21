@@ -18,6 +18,41 @@ class ProviderError(RuntimeError):
     """A safe provider failure; credentials are deliberately omitted."""
 
 
+CANVA_TEXT_LIMITS = {
+    "TITLE": 45,
+    "BODY": 140,
+    "CTA": 20,
+}
+
+
+def fit_canva_text(value: str, limit: int) -> str:
+    """Trim Canva overlay copy to a safe character limit, preferring whole words."""
+    if limit < 1:
+        raise ValueError("Canva text limit must be positive")
+    clean = " ".join(str(value or "").split())
+    if len(clean) <= limit:
+        return clean
+    shortened = clean[:limit].rsplit(" ", 1)[0].rstrip(" ,.;:!?-—")
+    return shortened or clean[:limit].rstrip()
+
+
+def build_canva_text_fields(
+    title: str,
+    body: str,
+    cta: str,
+    *,
+    title_field: str = "TITLE",
+    body_field: str = "BODY",
+    cta_field: str = "CTA",
+) -> dict[str, str]:
+    """Build Canva autofill text with the Malay Tyres overlay limits applied."""
+    return {
+        title_field: fit_canva_text(title, CANVA_TEXT_LIMITS["TITLE"]),
+        body_field: fit_canva_text(body, CANVA_TEXT_LIMITS["BODY"]),
+        cta_field: fit_canva_text(cta, CANVA_TEXT_LIMITS["CTA"]),
+    }
+
+
 def _session(session: Any | None) -> Any:
     if session is not None:
         return session

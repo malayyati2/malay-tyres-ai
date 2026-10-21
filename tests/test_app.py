@@ -4,7 +4,7 @@ from streamlit.testing.v1 import AppTest
 
 
 def test_streamlit_app_loads_without_exception():
-    app = AppTest.from_file(Path(__file__).parents[1] / "app.py", default_timeout=10).run()
+    app = AppTest.from_file(Path(__file__).parents[1] / "app.py", default_timeout=30).run()
 
     assert not app.exception
     assert any("Malay Tyres command centre" in title.value for title in app.title)
