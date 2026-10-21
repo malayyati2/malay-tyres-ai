@@ -53,6 +53,17 @@ def build_canva_text_fields(
     }
 
 
+def fresh_image_prompt(base_prompt: str, variation_id: str | None = None) -> str:
+    """Add a unique creative direction so every image request is a new variation."""
+    token = variation_id or uuid.uuid4().hex
+    return (
+        "Create a genuinely new image variation. Do not reuse a previous composition, camera angle, vehicle position, "
+        "background, lighting setup, or crop. Keep the business style consistent but change the visual story each time.\n"
+        f"Creative variation token: {token}\n"
+        f"Campaign image direction: {str(base_prompt or '').strip()}"
+    )
+
+
 def _session(session: Any | None) -> Any:
     if session is not None:
         return session

@@ -9,6 +9,7 @@ from tyre_agents.providers import (
     ProviderError,
     WhatsAppAdapter,
     build_canva_text_fields,
+    fresh_image_prompt,
 )
 
 
@@ -115,3 +116,13 @@ def test_canva_overlay_copy_is_limited_to_template_safe_lengths():
     assert len(fields["BODY"]) <= CANVA_TEXT_LIMITS["BODY"]
     assert len(fields["CTA"]) <= CANVA_TEXT_LIMITS["CTA"]
     assert not fields["TITLE"].endswith(" ")
+
+
+def test_fresh_image_prompt_changes_with_each_variation_token():
+    first = fresh_image_prompt("Premium tyre service", "campaign-1")
+    second = fresh_image_prompt("Premium tyre service", "campaign-2")
+
+    assert first != second
+    assert "campaign-1" in first
+    assert "campaign-2" in second
+    assert "Do not reuse a previous composition" in first

@@ -42,6 +42,7 @@ from tyre_agents.providers import (
     ProviderError,
     WhatsAppAdapter,
     build_canva_text_fields,
+    fresh_image_prompt,
 )
 from tyre_agents.gemini_text import GeminiTextGenerator
 
@@ -83,6 +84,8 @@ def oauth_db_init() -> None:
 
 def _supabase_token_config() -> tuple[str, str]:
     base_url = secret("SUPABASE_URL").rstrip("/")
+    if base_url.endswith("/rest/v1"):
+        base_url = base_url[:-len("/rest/v1")]
     service_key = secret("SUPABASE_SERVICE_ROLE_KEY")
     return base_url, service_key
 
@@ -171,9 +174,22 @@ def google_redirect_uri() -> str:
 
 
 def google_connected() -> bool:
-    if "google_stored_access_token" not in st.session_state:
-        st.session_state.google_stored_access_token = oauth_token_get("google")[0]
-    return bool(st.session_state.get("google_access_token") or st.session_state.google_stored_access_token)
+    return bool(st.session_state.get("google_access_token") or st.session_state.get("google_stored_access_token"))
+
+
+def load_persisted_connection_state() -> None:
+    """Load durable OAuth tokens only when the Connections screen is opened."""
+    if st.session_state.get("persisted_connection_state_loaded"):
+        return
+    google_access, google_refresh, google_expiry = oauth_token_get("google")
+    canva_access, canva_refresh, canva_expiry = oauth_token_get("canva")
+    st.session_state.google_stored_access_token = google_access
+    st.session_state.google_stored_refresh_token = google_refresh
+    st.session_state.google_stored_expiry = google_expiry
+    st.session_state.canva_stored_token = canva_access
+    st.session_state.canva_stored_refresh = canva_refresh
+    st.session_state.canva_stored_expiry = canva_expiry
+    st.session_state.persisted_connection_state_loaded = True
 
 def google_state_secret() -> str:
     return secret("GOOGLE_OAUTH_STATE_SECRET") or secret("GOOGLE_CLIENT_SECRET")
@@ -393,15 +409,9 @@ def publish_google_review_reply(review_id: str, reply: str) -> None:
 
 
 def canva_access_token() -> str:
-    if "canva_stored_token" not in st.session_state:
-        stored_access, stored_refresh, stored_expiry = oauth_token_get("canva")
-        st.session_state.canva_stored_token = stored_access
-        st.session_state.canva_stored_refresh = stored_refresh
-        st.session_state.canva_stored_expiry = stored_expiry
-    else:
-        stored_access = st.session_state.canva_stored_token
-        stored_refresh = st.session_state.canva_stored_refresh
-        stored_expiry = st.session_state.canva_stored_expiry
+    stored_access = st.session_state.get("canva_stored_token", "")
+    stored_refresh = st.session_state.get("canva_stored_refresh", "")
+    stored_expiry = st.session_state.get("canva_stored_expiry", 0)
     token = str(st.session_state.get("canva_access_token") or stored_access or secret("CANVA_ACCESS_TOKEN"))
     refresh_token = str(st.session_state.get("canva_refresh_token") or stored_refresh or secret("CANVA_REFRESH_TOKEN"))
     expires_at = float(st.session_state.get("canva_token_expires_at", 0) or stored_expiry or 0)
@@ -937,18 +947,19 @@ def _finish_canva_design(draft: ContentDraft, asset_id: str) -> dict:
     )
 
 
-def generate_canva_design(draft: ContentDraft) -> dict:
+def generate_canva_design(draft: ContentDraft, variation_id: str | None = None) -> dict:
     field_title = secret("CANVA_TITLE_FIELD", "TITLE")
     field_body = secret("CANVA_BODY_FIELD", "BODY")
     field_cta = secret("CANVA_CTA_FIELD", "CTA")
     field_image = secret("CANVA_IMAGE_FIELD", "IMAGE")
     adapter = _canva_adapter()
     asset_name = f"Malay Tyres {draft.title[:30]} visual"
+    image_prompt = fresh_image_prompt(draft.image_prompt, variation_id)
     try:
         # Prefer Canva-native image generation: it uses the already-connected Canva OAuth
         # account and does not require a separate Cloudflare account/token.
         with st.spinner("Generating a fresh image with Canva AI..."):
-            asset_id = adapter.generate_image_asset(draft.image_prompt, name=asset_name)
+            asset_id = adapter.generate_image_asset(image_prompt, name=asset_name)
     except ProviderError as canva_error:
         # Preserve the optional Cloudflare route as a fallback if the user configured it.
         if not (secret("CLOUDFLARE_ACCOUNT_ID").strip() and secret("CLOUDFLARE_API_TOKEN").strip()):
@@ -959,19 +970,19 @@ def generate_canva_design(draft: ContentDraft) -> dict:
                 "must enable that capability or configure the optional Cloudflare fallback."
             ) from canva_error
         with st.spinner("Canva AI is unavailable; trying the configured Cloudflare image fallback..."):
-            image_bytes = generate_fresh_campaign_image(draft.image_prompt)
+            image_bytes = generate_fresh_campaign_image(image_prompt)
         asset_id = adapter.upload_image_asset(image_bytes, name=asset_name)
 
     return _finish_canva_design(draft, asset_id)
 
 
-def generate_gemini_design(draft: ContentDraft) -> dict:
+def generate_gemini_design(draft: ContentDraft, variation_id: str | None = None) -> dict:
     """Generate with Gemini, then optionally render the image through Canva."""
     prompt = (
         "Create a fresh, realistic premium marketing image for Malay Tyres, a local Indian tyre and vehicle-care business. "
         "Show a clean professional tyre-service or safe-road-travel scene with natural lighting and a believable car or SUV. "
         "No readable text, watermark, invented logo, fake phone number, or brand badge. Leave clean space for Canva overlay text. "
-        f"Campaign direction: {draft.image_prompt}"
+        f"{fresh_image_prompt(draft.image_prompt, variation_id)}"
     )
     image = GeminiImageAdapter(gemini_api_key(), model=gemini_image_model()).generate(prompt, aspect_ratio="9:16" if Destination.INSTAGRAM_STORY in draft.destinations else "4:5")
     if not canva_template_ready():
@@ -989,20 +1000,20 @@ def generate_gemini_design(draft: ContentDraft) -> dict:
     }
 
 
-def generate_visual_options(draft: ContentDraft) -> tuple[dict[str, dict], tuple[str, ...]]:
+def generate_visual_options(draft: ContentDraft, variation_id: str | None = None) -> tuple[dict[str, dict], tuple[str, ...]]:
     """Create one image with Gemini and one with Canva for side-by-side review."""
     options: dict[str, dict] = {}
     errors: list[str] = []
     if gemini_api_key():
         try:
-            options["Gemini"] = generate_gemini_design(draft)
+            options["Gemini"] = generate_gemini_design(draft, variation_id)
         except ProviderError as exc:
             errors.append(f"Gemini image: {exc}")
     else:
         errors.append("Gemini image: add GEMINI_API_KEY to Streamlit Secrets")
     if canva_template_ready():
         try:
-            options["Canva"] = {**generate_canva_design(draft), "label": "Canva AI image", "publishable": True}
+            options["Canva"] = {**generate_canva_design(draft, variation_id), "label": "Canva AI image", "publishable": True}
         except ProviderError as exc:
             errors.append(f"Canva image: {exc}")
     else:
@@ -1465,7 +1476,10 @@ def render_content_studio() -> None:
             st.session_state.design_error = None
             add_activity("Content agent", f"Generated copy with {copy_provider} for {topic}")
             with st.spinner("Generating one fresh Gemini image and one fresh Canva image..."):
-                options, image_errors = generate_visual_options(draft)
+                options, image_errors = generate_visual_options(
+                    draft,
+                    variation_id=f"{draft_id}-new-{uuid.uuid4().hex}",
+                )
             st.session_state.image_candidates = options
             st.session_state.image_errors = image_errors
             if options:
@@ -1486,7 +1500,10 @@ def render_content_studio() -> None:
     if st.button("Regenerate both images", icon=":material/refresh:", width="stretch"):
         st.session_state.image_generation_number += 1
         with st.spinner("Generating new Gemini and Canva image options..."):
-            options, image_errors = generate_visual_options(draft)
+            options, image_errors = generate_visual_options(
+                draft,
+                variation_id=f"{draft.draft_id}-regenerated-{st.session_state.image_generation_number}-{uuid.uuid4().hex}",
+            )
         st.session_state.image_candidates = options
         st.session_state.image_errors = image_errors
         st.session_state.selected_image_provider = next(iter(options), None)
@@ -1533,6 +1550,7 @@ def render_content_studio() -> None:
 
 
 def render_connections() -> None:
+    load_persisted_connection_state()
     st.header("Connections and guardrails")
     st.write("Configure Canva, Instagram and WhatsApp once in Streamlit secrets. The content studio then creates the Canva visual and publishes only after approval.")
     st.info("This app uses Canva Connect OAuth for template autofill/export and attempts Canva-native AI image generation first; Cloudflare Workers AI is an optional fallback. Canva image generation is a preview API and consumes Canva AI credits. The one-click diagnostic makes read-only checks for Google, Canva, Instagram and WhatsApp and sends one tiny Gemini test request. It does not generate an image, publish a post, or send a message. Secrets are never displayed.", icon=":material/info:")
