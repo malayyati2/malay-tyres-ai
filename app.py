@@ -1268,11 +1268,11 @@ def render_manual_canva_workflow(draft: ContentDraft) -> None:
         st.subheader("Create the poster in Canva AI")
         design = st.session_state.generated_design or {}
         prompt = design.get("generation_prompt", "")
-        st.write("Copy this new prompt into Canva AI on canva.com. Canva AI will create the complete poster design, not the app.")
+        st.write("Copy this new prompt into Canva's **AI Poster Generator / Create posters with AI**. Do not paste it into the image-only generator. Canva AI will create the poster with the photograph, layout, and text; the app does not generate the poster.")
         st.code(prompt, language="text")
         st.caption("Every new prompt changes the photograph, composition, layout direction, lighting, subject placement, and text hierarchy. Check the logo, address, phone number, and spelling in Canva before using the poster.")
         if prompt:
-            st.link_button("Open Canva", "https://www.canva.com/", icon=":material/open_in_new:", width="stretch")
+            st.link_button("Open Canva AI Poster Generator", "https://www.canva.com/ai-poster-generator/", icon=":material/open_in_new:", width="stretch")
 
         image_url = st.text_input(
             "Public Canva image/export URL",
@@ -1532,7 +1532,7 @@ def render_connections() -> None:
     with st.container(border=True):
         st.subheader("Use Canva AI manually")
         st.caption("Open Canva AI, paste the fresh prompt from Content studio, inspect the complete poster, correct the logo/text if needed, export it, and paste the public HTTPS image/export URL back into the app.")
-        st.link_button("Open Canva", "https://www.canva.com/", icon=":material/open_in_new:", width="stretch")
+        st.link_button("Open Canva AI Poster Generator", "https://www.canva.com/ai-poster-generator/", icon=":material/open_in_new:", width="stretch")
         st.info("Canva OAuth is no longer required for image generation or publishing in this workflow. The app does not call Canva's image-generation or Brand Template APIs.", icon=":material/info:")
         with st.expander("Legacy Canva OAuth (optional diagnostics)"):
             st.caption("These controls are kept only for existing saved connections; the manual prompt workflow does not depend on them.")

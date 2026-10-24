@@ -43,7 +43,7 @@ WHATSAPP_RECIPIENT_PHONE = "+91xxxxxxxxxx"
 META_GRAPH_API_VERSION = "v21.0"
 ```
 
-The app does not call Canva image-generation APIs. In **Content studio**, it creates a new full-poster prompt every time. Copy that prompt into Canva AI manually, inspect the generated poster, replace any mistyped logo or text with the real Malay Tyres assets, export the finished poster, and paste a public HTTPS Canva image/export URL back into the app. Add a short description of what the final poster shows; the app uses it to prepare a matching caption. Publishing remains approval-gated.
+The app does not call Canva image-generation APIs. In **Content studio**, it creates a new full-poster prompt every time. Copy that prompt into Canva's **AI Poster Generator / Create posters with AI**—not the image-only generator—so Canva creates the photograph, layout, and text in one poster. Inspect the generated poster, replace any mistyped logo or text with the real Malay Tyres assets, export the finished poster, and paste a public HTTPS Canva image/export URL back into the app. Add a short description of what the final poster shows; the app uses it to prepare a matching caption. Publishing remains approval-gated.
 
 The generated Canva prompt includes a new visual direction and layout direction on every request. The prompt asks Canva AI for a complete poster, not a fixed Brand Template autofill.
 

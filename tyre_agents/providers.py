@@ -120,6 +120,7 @@ def manual_canva_poster_prompt(
     visual = CREATIVE_IMAGE_DIRECTIONS[int.from_bytes(digest[:4], "big") % len(CREATIVE_IMAGE_DIRECTIONS)]
     layout = POSTER_LAYOUT_DIRECTIONS[int.from_bytes(digest[4:8], "big") % len(POSTER_LAYOUT_DIRECTIONS)]
     return (
+        "Use Canva's AI Poster Generator / Create posters with AI, not the AI Image Generator or Magic Media image-only tool. "
         f"Create a complete, ready-to-publish 4:5 Instagram promotional poster for {business_name}, an Indian tyre and vehicle-care business. "
         "This must be a brand-new poster concept, not a template autofill and not a copy of a previous design. "
         "Generate one photorealistic automotive advertising photograph with a real camera look: accurate vehicle proportions, believable tyre tread and alloy-wheel detail, natural materials, realistic Indian setting, and documentary-quality lighting. "
