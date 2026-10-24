@@ -1194,6 +1194,10 @@ def initialize_state() -> None:
         "Canva": False,
         "Instagram + WhatsApp": False,
     })
+    # Load durable OAuth tokens before any workspace can use Canva or Google.
+    # Previously this happened only inside Connections, so opening Content
+    # studio directly after a new/restarted session made Canva look unconfigured.
+    load_persisted_connection_state()
 
 
 def add_activity(agent: str, message: str) -> None:
