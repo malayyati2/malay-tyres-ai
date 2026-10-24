@@ -10,6 +10,7 @@ from tyre_agents.providers import (
     WhatsAppAdapter,
     build_canva_text_fields,
     fresh_image_prompt,
+    manual_canva_poster_prompt,
 )
 
 
@@ -161,4 +162,15 @@ def test_fresh_image_prompt_changes_with_each_variation_token():
     assert "campaign-2" in second
     assert "Do not reuse a previous composition" in first
     assert "photorealistic" in first
+    assert "Unique generation signature" in second
+
+
+def test_manual_canva_poster_prompt_changes_visual_and_layout_direction():
+    first = manual_canva_poster_prompt("tyre pressure checks", "campaign-1")
+    second = manual_canva_poster_prompt("tyre pressure checks", "campaign-2")
+
+    assert first != second
+    assert "complete, ready-to-publish 4:5 Instagram promotional poster" in first
+    assert "not a template autofill" in first
+    assert "Malay Tyres" in first
     assert "Unique generation signature" in second

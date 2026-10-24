@@ -44,6 +44,17 @@ CREATIVE_IMAGE_DIRECTIONS = (
     "close realistic portrait of a professional tyre technician presenting a checked wheel beside a customer car, friendly service setting, natural expression and uncluttered background",
 )
 
+POSTER_LAYOUT_DIRECTIONS = (
+    "use a bold diagonal red-and-black composition with the hero vehicle crossing the frame and a clean lower caption panel",
+    "use a premium split layout with the realistic workshop photograph on one side and a strong white information panel on the other",
+    "use a clean editorial layout with a large hero photograph, a small red service badge, and generous white space for the offer",
+    "use a dynamic asymmetric layout with a curved red accent, the vehicle placed off-centre, and a dark footer strip for contact details",
+    "use a modern full-bleed photograph with a translucent white text card and restrained red highlights, avoiding the previous poster structure",
+    "use a documentary-style layout with a wide hero image, compact service facts, and a strong bottom call-to-action bar",
+    "use a high-contrast black, white, and red layout with a close-up wheel detail, a small supporting image area, and a clear contact block",
+    "use a bright roadside-travel composition with the hero vehicle in the upper third and a fresh lower section for safety advice and booking details",
+)
+
 
 def fit_canva_text(value: str, limit: int) -> str:
     """Trim Canva overlay copy to a safe character limit, preferring whole words."""
@@ -88,6 +99,36 @@ def fresh_image_prompt(base_prompt: str, variation_id: str | None = None) -> str
         f"New visual direction for this request: {direction}.\n"
         f"Campaign subject: {str(base_prompt or '').strip()}\n"
         f"Unique generation signature: {token}"
+    )
+
+
+def manual_canva_poster_prompt(
+    base_prompt: str,
+    variation_id: str | None = None,
+    *,
+    business_name: str = "Malay Tyres",
+    address: str = "74, Dewas Road, Ujjain (M.P.) 456010",
+    phone: str = "+91 99260 91313",
+) -> str:
+    """Create a fresh full-poster prompt for manual Canva AI use.
+
+    This intentionally asks Canva's website to create the whole poster rather
+    than asking the app to call Canva's image-generation/autofill APIs.
+    """
+    token = variation_id or uuid.uuid4().hex
+    digest = hashlib.sha256(token.encode("utf-8")).digest()
+    visual = CREATIVE_IMAGE_DIRECTIONS[int.from_bytes(digest[:4], "big") % len(CREATIVE_IMAGE_DIRECTIONS)]
+    layout = POSTER_LAYOUT_DIRECTIONS[int.from_bytes(digest[4:8], "big") % len(POSTER_LAYOUT_DIRECTIONS)]
+    return (
+        f"Create a complete, ready-to-publish 4:5 Instagram promotional poster for {business_name}, an Indian tyre and vehicle-care business. "
+        "This must be a brand-new poster concept, not a template autofill and not a copy of a previous design. "
+        "Generate one photorealistic automotive advertising photograph with a real camera look: accurate vehicle proportions, believable tyre tread and alloy-wheel detail, natural materials, realistic Indian setting, and documentary-quality lighting. "
+        f"Visual direction: {visual}. Layout direction: {layout}. Campaign subject: {str(base_prompt or '').strip()}. "
+        "Use only a restrained red, black, white, and charcoal brand palette. Include a clean logo area for the Malay Tyres logo, but do not invent or distort a logo. "
+        f"Use these exact business details if text is rendered: business name '{business_name}', address '{address}', phone '{phone}'. "
+        "Keep all rendered text short, large, high-contrast, correctly spelled, and easy to read on a phone. Do not add invented prices, claims, services, addresses, phone numbers, hashtags, watermarks, or other brands. "
+        "Make the composition, crop, camera angle, subject placement, lighting, accent shapes, text hierarchy, and CTA treatment different from previous generations. "
+        f"Unique generation signature: {token}. Before publishing, inspect every word and replace any AI-mistyped logo or text in Canva with the real logo and exact business details."
     )
 
 
