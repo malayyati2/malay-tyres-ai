@@ -27,9 +27,6 @@ Create `.streamlit/secrets.toml` locally (it is ignored by Git) and add the foll
 GEMINI_API_KEY = "your-google-ai-studio-api-key"
 GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
 
-CLOUDFLARE_ACCOUNT_ID = "your-cloudflare-account-id"
-CLOUDFLARE_API_TOKEN = "your-workers-ai-api-token"
-
 CANVA_CLIENT_ID = "your-canva-client-id"
 CANVA_CLIENT_SECRET = "your-canva-client-secret"
 CANVA_REDIRECT_URI = "https://your-app-name.streamlit.app"
@@ -53,7 +50,7 @@ WHATSAPP_RECIPIENT_PHONE = "+91xxxxxxxxxx"
 META_GRAPH_API_VERSION = "v21.0"
 ```
 
-The Canva template must be a published Brand Template with autofill fields matching the configured field names, including `IMAGE` when you want the generated image inserted into the branded design. Canva AI image generation is a preview API, consumes Canva AI credits, requires the `asset:write` scope and the connected user's `image_generation` capability, and returns a temporary image/export URL. The app checks that capability from **Connections** before generation. Canva recommends leaving `CANVA_IMAGE_MODEL` empty so it can select an available model automatically; pin a model only when you specifically need one.
+The Canva template must be a published Brand Template with autofill fields matching the configured field names, including `IMAGE` when you want the generated image inserted into the branded design. Canva AI image generation is a preview API, consumes Canva AI credits, requires the `asset:write` scope and the connected user's `image_generation` capability, and returns a temporary image/export URL. The app checks that capability from **Connections** before generation and uses Canva as the only active image path in the first-step workflow. Canva recommends leaving `CANVA_IMAGE_MODEL` empty so it can select an available model automatically; pin a model only when you specifically need one.
 
 The Canva overlay text is automatically shortened before autofill so it stays within the template-safe limits: `TITLE` is 45 characters or fewer, `BODY` is 140 characters or fewer, and `CTA` is 20 characters or fewer. The full caption remains available for social publishing; only the text rendered on the image is shortened.
 
