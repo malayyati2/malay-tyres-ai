@@ -453,7 +453,7 @@ def gemini_image_model() -> str:
 
 
 def canva_image_model() -> str:
-    configured = secret("CANVA_IMAGE_MODEL").strip()
+    configured = secret("CANVA_IMAGE_MODEL", "craft_v1_2k").strip()
     if configured and configured not in CANVA_IMAGE_MODELS:
         raise ProviderError(
             "CANVA_IMAGE_MODEL must be empty for automatic selection or one of: "
@@ -1001,7 +1001,12 @@ def generate_canva_design(draft: ContentDraft, variation_id: str | None = None) 
             "Check Canva AI capability, asset:write permission, AI credits, and the Canva app connection."
         ) from canva_error
 
-    return _finish_canva_design(draft, asset_id)
+    design = _finish_canva_design(draft, asset_id)
+    return {
+        **design,
+        "generation_prompt": image_prompt,
+        "generation_model": canva_image_model() or "automatic",
+    }
 
 
 def generate_gemini_design(draft: ContentDraft, variation_id: str | None = None) -> dict:
@@ -1384,16 +1389,16 @@ def render_draft_preview(draft: ContentDraft) -> None:
         )
         for field_name, value in canva_fields.items():
             st.write(f"**{field_name}** ({len(value)} characters): {value}")
-        st.caption("The design brief is retained as an audit trail. A new image is generated for each request, uploaded to Canva, then inserted into the IMAGE field while TITLE, BODY and CTA are filled.")
+        st.caption("The Canva template keeps the same branded layout, but Canva AI creates a new realistic hero image and a different visual prompt for every generation. TITLE, BODY and CTA are then filled into the template.")
 
 
 def render_generated_design(draft: ContentDraft) -> None:
     with st.container(border=True):
-        st.subheader("Compare Gemini and Canva images")
+        st.subheader("Canva AI image")
         candidates = st.session_state.image_candidates
         selected = st.session_state.get("selected_image_provider")
         if candidates:
-            st.caption("Both providers create a fresh image for this campaign. Select the version you prefer before approving.")
+            st.caption("The branded template layout stays consistent for brand recognition. The Canva AI image and its visual direction change for every generation.")
             columns = st.columns(len(candidates))
             for column, provider in zip(columns, candidates):
                 candidate = candidates[provider]
@@ -1422,13 +1427,16 @@ def render_generated_design(draft: ContentDraft) -> None:
                         st.rerun()
                     if candidate.get("design_url"):
                         st.link_button("Open in Canva", candidate["design_url"], icon=":material/edit:", width="stretch")
+                    if candidate.get("generation_prompt"):
+                        with st.expander("See the exact Canva AI prompt"):
+                            st.code(candidate["generation_prompt"], language="text")
             if selected and not candidates[selected].get("image_url"):
                 st.warning("This Gemini option can be previewed and downloaded, but social publishing needs a public Canva image URL. Select the Canva option to publish.", icon=":material/info:")
         elif st.session_state.image_errors:
             for error in st.session_state.image_errors:
                 st.warning(error, icon=":material/warning:")
         else:
-            st.info("Gemini and Canva will create separate image options when you submit a campaign.", icon=":material/image:")
+            st.info("Canva AI will create a new realistic image with a different visual direction when you submit a campaign.", icon=":material/image:")
 
 
 def render_content_studio() -> None:

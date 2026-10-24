@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 import base64
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass
@@ -24,15 +25,24 @@ CANVA_TEXT_LIMITS = {
     "CTA": 20,
 }
 
-# Canva recommends omitting the model so it can choose the best available
-# model and fall back when a model is temporarily unavailable. These values
-# are accepted when an operator intentionally pins a model in Streamlit
-# Secrets.
+# These are the Canva image-generation models accepted by the app. The app
+# defaults to Craft because the campaign needs realistic marketing visuals.
 CANVA_IMAGE_MODELS = {
     "craft_v1_2k",
     "lucid_origin",
     "z_image_turbo",
 }
+
+CREATIVE_IMAGE_DIRECTIONS = (
+    "low three-quarter front view of a modern Indian SUV parked outside a bright tyre workshop after light rain, with crisp tread detail and soft morning reflections",
+    "close-up editorial photograph of a premium alloy wheel and tyre being inspected by a technician in a clean workshop, shallow depth of field and warm side lighting",
+    "dynamic road-safety scene with a family SUV preparing for a long highway journey at sunrise, realistic Indian roadside setting and clean open space around the vehicle",
+    "wide professional workshop photograph showing a technician checking tyre pressure beside a polished sedan, bright overhead light, natural shadows and a premium service atmosphere",
+    "low-angle product-style photograph of a fresh tyre and alloy wheel on a clean charcoal studio floor, subtle yellow accent light, realistic rubber texture and dramatic but natural contrast",
+    "overhead lifestyle photograph of a vehicle-care bay with a compact SUV, neatly arranged tools and a technician working carefully, believable detail and documentary realism",
+    "side profile photograph of a clean crossover driving on a safe open road with distant Indian landscape, golden-hour light, visible wheel detail and a fresh travel mood",
+    "close realistic portrait of a professional tyre technician presenting a checked wheel beside a customer car, friendly service setting, natural expression and uncluttered background",
+)
 
 
 def fit_canva_text(value: str, limit: int) -> str:
@@ -64,13 +74,20 @@ def build_canva_text_fields(
 
 
 def fresh_image_prompt(base_prompt: str, variation_id: str | None = None) -> str:
-    """Add a unique creative direction so every image request is a new variation."""
+    """Build a materially different, photorealistic prompt for every image request."""
     token = variation_id or uuid.uuid4().hex
+    digest = hashlib.sha256(token.encode("utf-8")).digest()
+    direction = CREATIVE_IMAGE_DIRECTIONS[int.from_bytes(digest[:4], "big") % len(CREATIVE_IMAGE_DIRECTIONS)]
     return (
-        "Create a genuinely new image variation. Do not reuse a previous composition, camera angle, vehicle position, "
-        "background, lighting setup, or crop. Keep the business style consistent but change the visual story each time.\n"
-        f"Creative variation token: {token}\n"
-        f"Campaign image direction: {str(base_prompt or '').strip()}"
+        "Create ONE genuinely new, photorealistic premium automotive advertising photograph for Malay Tyres. "
+        "Make it look like a real camera photograph, not an illustration, 3D render, collage, or generic stock image. "
+        "Do not reuse a previous composition, camera angle, vehicle position, background, lighting setup, or crop. "
+        "Show realistic Indian-market vehicles, believable tyre rubber and alloy-wheel detail, natural materials, and accurate perspective. "
+        "No readable text, letters, logos, watermark, fake brand badge, phone number, or typography in the generated image. "
+        "Leave a clean safe area for the fixed Canva overlay template.\n"
+        f"New visual direction for this request: {direction}.\n"
+        f"Campaign subject: {str(base_prompt or '').strip()}\n"
+        f"Unique generation signature: {token}"
     )
 
 

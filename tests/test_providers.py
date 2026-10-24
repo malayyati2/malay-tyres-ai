@@ -160,3 +160,5 @@ def test_fresh_image_prompt_changes_with_each_variation_token():
     assert "campaign-1" in first
     assert "campaign-2" in second
     assert "Do not reuse a previous composition" in first
+    assert "photorealistic" in first
+    assert "Unique generation signature" in second

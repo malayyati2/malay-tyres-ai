@@ -31,9 +31,9 @@ CANVA_CLIENT_ID = "your-canva-client-id"
 CANVA_CLIENT_SECRET = "your-canva-client-secret"
 CANVA_REDIRECT_URI = "https://your-app-name.streamlit.app"
 CANVA_ACCESS_TOKEN = "your-canva-oauth-access-token"
-# Optional: leave empty so Canva selects the best available model.
-# Valid pinned values: craft_v1_2k, lucid_origin, z_image_turbo
-CANVA_IMAGE_MODEL = ""
+# Craft is selected by default for realistic marketing images.
+# You may leave this value or choose lucid_origin / z_image_turbo.
+CANVA_IMAGE_MODEL = "craft_v1_2k"
 CANVA_BRAND_TEMPLATE_ID = "your-canva-brand-template-id"
 CANVA_TITLE_FIELD = "TITLE"
 CANVA_BODY_FIELD = "BODY"
@@ -50,7 +50,7 @@ WHATSAPP_RECIPIENT_PHONE = "+91xxxxxxxxxx"
 META_GRAPH_API_VERSION = "v21.0"
 ```
 
-The Canva template must be a published Brand Template with autofill fields matching the configured field names, including `IMAGE` when you want the generated image inserted into the branded design. Canva AI image generation is a preview API, consumes Canva AI credits, requires the `asset:write` scope and the connected user's `image_generation` capability, and returns a temporary image/export URL. The app checks that capability from **Connections** before generation and uses Canva as the only active image path in the first-step workflow. Canva recommends leaving `CANVA_IMAGE_MODEL` empty so it can select an available model automatically; pin a model only when you specifically need one.
+The Canva template is intentionally used only for the fixed branded layout and overlay fields. Canva AI creates a new photorealistic hero image for every generation with a changing visual direction, then the image is inserted into the `IMAGE` field. Canva AI image generation is a preview API, consumes Canva AI credits, requires the `asset:write` scope and the connected user's `image_generation` capability, and returns a temporary image/export URL. The app checks that capability from **Connections** before generation. Craft (`craft_v1_2k`) is selected by default because Canva documents it for marketing materials; `lucid_origin` and `z_image_turbo` remain available as alternatives.
 
 The Canva overlay text is automatically shortened before autofill so it stays within the template-safe limits: `TITLE` is 45 characters or fewer, `BODY` is 140 characters or fewer, and `CTA` is 20 characters or fewer. The full caption remains available for social publishing; only the text rendered on the image is shortened.
 
