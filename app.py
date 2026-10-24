@@ -1041,17 +1041,15 @@ def generate_gemini_design(draft: ContentDraft, variation_id: str | None = None)
     }
 
 
-def generate_visual_options(draft: ContentDraft, variation_id: str | None = None) -> tuple[dict[str, dict], tuple[str, ...]]:
-    """Create one image with Gemini and one with Canva for side-by-side review."""
+def generate_visual_options(
+    draft: ContentDraft,
+    variation_id: str | None = None,
+    *,
+    include_gemini: bool = True,
+) -> tuple[dict[str, dict], tuple[str, ...]]:
+    """Create the requested image options, with Canva available as a first-step path."""
     options: dict[str, dict] = {}
     errors: list[str] = []
-    if gemini_api_key():
-        try:
-            options["Gemini"] = generate_gemini_design(draft, variation_id)
-        except ProviderError as exc:
-            errors.append(f"Gemini image: {exc}")
-    else:
-        errors.append("Gemini image: add GEMINI_API_KEY to Streamlit Secrets")
     if canva_template_ready():
         try:
             options["Canva"] = {**generate_canva_design(draft, variation_id), "label": "Canva AI image", "publishable": True}
@@ -1059,6 +1057,14 @@ def generate_visual_options(draft: ContentDraft, variation_id: str | None = None
             errors.append(f"Canva image: {exc}")
     else:
         errors.append("Canva image: connect Canva and configure CANVA_BRAND_TEMPLATE_ID")
+    if include_gemini:
+        if gemini_api_key():
+            try:
+                options["Gemini"] = generate_gemini_design(draft, variation_id)
+            except ProviderError as exc:
+                errors.append(f"Gemini image: {exc}")
+        else:
+            errors.append("Gemini image: add GEMINI_API_KEY to Streamlit Secrets")
     return options, tuple(errors)
 
 def generate_campaign_draft(topic: str, tone: str, draft_id: str, destinations: tuple[Destination, ...]) -> tuple[ContentDraft, str]:
@@ -1518,10 +1524,11 @@ def render_content_studio() -> None:
             st.session_state.image_errors = ()
             st.session_state.design_error = None
             add_activity("Content agent", f"Generated copy with {copy_provider} for {topic}")
-            with st.spinner("Generating one fresh Gemini image and one fresh Canva image..."):
+            with st.spinner("Generating one fresh Canva AI image..."):
                 options, image_errors = generate_visual_options(
                     draft,
                     variation_id=f"{draft_id}-new-{uuid.uuid4().hex}",
+                    include_gemini=False,
                 )
             st.session_state.image_candidates = options
             st.session_state.image_errors = image_errors
@@ -1529,7 +1536,7 @@ def render_content_studio() -> None:
                 st.session_state.selected_image_provider = next(iter(options))
                 st.session_state.generated_design = options[st.session_state.selected_image_provider]
                 add_activity("Image agents", f"Generated {len(options)} image option(s) for comparison")
-                st.success("Caption and image options are ready. Choose the better image below.", icon=":material/check_circle:")
+                st.success("Caption and Canva image are ready. Review the design below.", icon=":material/check_circle:")
             else:
                 st.warning("The caption was created, but no image provider returned a result. Check Connections and try again.", icon=":material/warning:")
 
