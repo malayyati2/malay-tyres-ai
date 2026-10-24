@@ -36,6 +36,7 @@ except ImportError:  # Keeps a running app compatible with older cached deployme
 from tyre_agents.canva_oauth import create_pkce_request, exchange_code
 from tyre_agents.providers import (
     CanvaAdapter,
+    CANVA_IMAGE_MODELS,
     CANVA_TEXT_LIMITS,
     GeminiImageAdapter,
     InstagramAdapter,
@@ -452,7 +453,13 @@ def gemini_image_model() -> str:
 
 
 def canva_image_model() -> str:
-    return secret("CANVA_IMAGE_MODEL")
+    configured = secret("CANVA_IMAGE_MODEL").strip()
+    if configured and configured not in CANVA_IMAGE_MODELS:
+        raise ProviderError(
+            "CANVA_IMAGE_MODEL must be empty for automatic selection or one of: "
+            + ", ".join(sorted(CANVA_IMAGE_MODELS))
+        )
+    return configured
 
 
 def gemini_model() -> str:
@@ -463,7 +470,7 @@ def gemini_model() -> str:
     return configured
 
 
-def generate_review_reply(review) -> str:
+def generate_review_reply(review, *, use_llm: bool = True) -> str:
     """Write a service-specific reply without ever using the reviewer's name."""
     review_text = str(getattr(review, "text", "") or "").strip()
     rating = int(getattr(review, "rating", 5) or 5)
@@ -473,7 +480,7 @@ def generate_review_reply(review) -> str:
 
     # Use the language model when configured, with strict grounding in the review.
     api_key = gemini_api_key()
-    if api_key and review_text and review_text != "(Rating-only review)":
+    if use_llm and api_key and review_text and review_text != "(Rating-only review)":
         try:
             model = gemini_model()
             endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -643,6 +650,32 @@ def canva_diagnostics() -> dict[str, object]:
             results["Brand Template ID"] = ("skip", "Skipped because Canva did not accept the token.")
             results["Template fields"] = ("skip", "Skipped because Canva did not accept the token.")
             return results
+
+        capabilities_response = requests.get(
+            "https://api.canva.com/rest/v1/users/me/capabilities",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=20,
+        )
+        if capabilities_response.ok:
+            capabilities = capabilities_response.json().get("capabilities", [])
+            if "image_generation" in capabilities:
+                results["Canva AI image generation"] = (
+                    "pass",
+                    "The connected Canva account has the image_generation capability."
+                    " Canva will choose an available model automatically unless CANVA_IMAGE_MODEL is set.",
+                )
+            else:
+                results["Canva AI image generation"] = (
+                    "fail",
+                    "The connected Canva account does not have the image_generation capability."
+                    " Enable Canva AI/Magic Media for this account or team, then reconnect Canva.",
+                )
+        else:
+            results["Canva AI image generation"] = (
+                "warn",
+                f"Could not check Canva AI capability (HTTP {capabilities_response.status_code})."
+                " The generation request will provide the final capability error if unavailable.",
+            )
     except requests.RequestException as exc:
         results["OAuth token"] = ("fail", f"Could not reach Canva ({type(exc).__name__}). Try again.")
         results["Brand Template ID"] = ("skip", "Skipped because Canva could not be reached.")
@@ -955,11 +988,19 @@ def generate_canva_design(draft: ContentDraft, variation_id: str | None = None) 
     adapter = _canva_adapter()
     asset_name = f"Malay Tyres {draft.title[:30]} visual"
     image_prompt = fresh_image_prompt(draft.image_prompt, variation_id)
+    aspect_ratio = "portrait_4_5" if Destination.INSTAGRAM_FEED in draft.destinations else (
+        "portrait" if Destination.INSTAGRAM_STORY in draft.destinations else "square"
+    )
     try:
         # Prefer Canva-native image generation: it uses the already-connected Canva OAuth
         # account and does not require a separate Cloudflare account/token.
         with st.spinner("Generating a fresh image with Canva AI..."):
-            asset_id = adapter.generate_image_asset(image_prompt, name=asset_name)
+            asset_id = adapter.generate_image_asset(
+                image_prompt,
+                name=asset_name,
+                model=canva_image_model() or None,
+                aspect_ratio=aspect_ratio,
+            )
     except ProviderError as canva_error:
         # Preserve the optional Cloudflare route as a fallback if the user configured it.
         if not (secret("CLOUDFLARE_ACCOUNT_ID").strip() and secret("CLOUDFLARE_API_TOKEN").strip()):
@@ -1118,7 +1159,9 @@ def initialize_state() -> None:
         st.session_state.reviews = {
             review.review_id: {
                 "review": review,
-                "reply": generate_review_reply(review),
+                # Keep initial page load deterministic and offline. The operator
+                # can request live Gemini wording from Refresh suggested replies.
+                "reply": generate_review_reply(review, use_llm=False),
                 "salutation": DEFAULT_SALUTATION,
                 "reply_version": 0,
                 "status": "Ready to review",

@@ -83,6 +83,40 @@ def test_canva_native_image_generation_saves_asset_and_polls_job():
     assert fake.calls[1][0] == "https://canva.test/rest/v1/image-generations/image-job-1"
 
 
+def test_canva_native_generation_omits_model_for_automatic_selection():
+    fake = FakeSession([
+        Response({"job": {"id": "image-job-2", "status": "success", "result": {
+            "image": {"asset": {"id": "canva-asset-2"}}
+        }}}),
+    ])
+
+    CanvaAdapter("secret-token", "template", base_url="https://canva.test/rest/v1", session=fake).generate_image_asset(
+        "A premium tyre shop",
+        poll_attempts=1,
+        poll_interval_seconds=0,
+    )
+
+    request = fake.calls[0][1]["json"]
+    assert "model" not in request
+
+
+def test_canva_native_generation_accepts_current_pinned_model():
+    fake = FakeSession([
+        Response({"job": {"id": "image-job-3", "status": "success", "result": {
+            "image": {"asset": {"id": "canva-asset-3"}}
+        }}}),
+    ])
+
+    CanvaAdapter("secret-token", "template", base_url="https://canva.test/rest/v1", session=fake).generate_image_asset(
+        "A premium tyre shop",
+        model="craft_v1_2k",
+        poll_attempts=1,
+        poll_interval_seconds=0,
+    )
+
+    assert fake.calls[0][1]["json"]["model"] == "craft_v1_2k"
+
+
 def test_gemini_image_generation_returns_previewable_bytes_without_network():
     response = SimpleNamespace(
         candidates=[SimpleNamespace(content=SimpleNamespace(parts=[

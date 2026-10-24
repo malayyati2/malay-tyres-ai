@@ -24,6 +24,16 @@ CANVA_TEXT_LIMITS = {
     "CTA": 20,
 }
 
+# Canva recommends omitting the model so it can choose the best available
+# model and fall back when a model is temporarily unavailable. These values
+# are accepted when an operator intentionally pins a model in Streamlit
+# Secrets.
+CANVA_IMAGE_MODELS = {
+    "craft_v1_2k",
+    "lucid_origin",
+    "z_image_turbo",
+}
+
 
 def fit_canva_text(value: str, limit: int) -> str:
     """Trim Canva overlay copy to a safe character limit, preferring whole words."""
@@ -334,6 +344,7 @@ class CanvaAdapter:
         return str(asset_id)
 
     def generate_image_asset(self, prompt: str, *, name: str = "Malay Tyres AI visual",
+                             model: str | None = None,
                              aspect_ratio: str = "square", poll_attempts: int = 60,
                              poll_interval_seconds: float = 1.0) -> str:
         """Generate an image with Canva AI and save it directly to the user's Canva assets.
@@ -348,19 +359,24 @@ class CanvaAdapter:
         allowed_ratios = {"square", "landscape", "portrait", "landscape_3_2", "portrait_2_3", "portrait_4_5"}
         if aspect_ratio not in allowed_ratios:
             raise ProviderError("Unsupported Canva image aspect ratio")
+        if model and model not in CANVA_IMAGE_MODELS:
+            raise ProviderError("Unsupported Canva image model")
         s = _session(self.session)
         root = self.base_url.rstrip("/")
         headers = {"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"}
+        request = {
+            "prompt": prompt.strip()[:10000],
+            "idempotency_key": str(uuid.uuid4()),
+            "aspect_ratio": aspect_ratio,
+            "asset_upload": {"type": "upload", "asset_name": name[:255]},
+        }
+        if model:
+            request["model"] = model
         payload = _check(
             s.post(
                 f"{root}/image-generations",
                 headers={**headers, "Content-Type": "application/json"},
-                json={
-                    "prompt": prompt.strip()[:5000],
-                    "idempotency_key": str(uuid.uuid4()),
-                    "aspect_ratio": aspect_ratio,
-                    "asset_upload": {"type": "upload", "asset_name": name[:255]},
-                },
+                json=request,
             ),
             "Canva image generation",
         )
